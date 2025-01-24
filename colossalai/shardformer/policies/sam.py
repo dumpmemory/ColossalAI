@@ -1,6 +1,6 @@
 import colossalai.shardformer.layer as col_nn
 
-from ..modeling.sam import forward_fn, get_sam_flash_attention_forward, get_sam_vision_flash_attention_forward
+from ..modeling.sam import forward_fn
 from .base_policy import ModulePolicyDescription, Policy, SubModuleReplacementDescription
 
 __all__ = ["SamPolicy", "SamModelPolicy"]
@@ -15,7 +15,6 @@ class SamPolicy(Policy):
 
     def module_policy(self):
         from transformers.models.sam.modeling_sam import (
-            SamAttention,
             SamTwoWayAttentionBlock,
             SamTwoWayTransformer,
             SamVisionAttention,
@@ -28,8 +27,12 @@ class SamPolicy(Policy):
             norm_cls = col_nn.FusedLayerNorm
         else:
             norm_cls = col_nn.LayerNorm
+        use_zbv = self.pipeline_stage_manager is not None and self.pipeline_stage_manager.use_zbv
 
         if self.shard_config.enable_tensor_parallelism:
+            assert (
+                self.model.config.vision_config.num_attention_heads % self.shard_config.tensor_parallel_size == 0
+            ), f"The number of attention heads must be divisible by tensor parallel size."
             policy[SamVisionLayer] = ModulePolicyDescription(
                 attribute_replacement={
                     "attn.num_attention_heads": self.model.config.vision_config.num_attention_heads
@@ -40,20 +43,34 @@ class SamPolicy(Policy):
                         suffix="attn.qkv",
                         target_module=col_nn.FusedLinear1D_Col,
                         kwargs={
-                            "n_fused": 3,
+                            "split_sizes": [self.model.config.vision_config.hidden_size] * 3,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
                         },
                     ),
                     SubModuleReplacementDescription(
                         suffix="attn.proj",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="mlp.lin1",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="mlp.lin2",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                 ],
             )
@@ -66,58 +83,114 @@ class SamPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="self_attn.q_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="self_attn.k_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="self_attn.v_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="self_attn.out_proj",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="cross_attn_token_to_image.q_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="cross_attn_token_to_image.k_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="cross_attn_token_to_image.v_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="cross_attn_token_to_image.out_proj",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="mlp.lin1",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="mlp.lin2",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="cross_attn_image_to_token.q_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="cross_attn_image_to_token.k_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="cross_attn_image_to_token.v_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="cross_attn_image_to_token.out_proj",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                 ],
             )
@@ -130,18 +203,236 @@ class SamPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="final_attn_token_to_image.q_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="final_attn_token_to_image.k_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="final_attn_token_to_image.v_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="final_attn_token_to_image.out_proj",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                ],
+            )
+
+            # add `DropoutForParallelInput` layer to replace the useage of `nn.functional.dropout`
+            policy[SamVisionAttention] = ModulePolicyDescription(
+                attribute_replacement={
+                    "dropout_layer": col_nn.DropoutForParallelInput(self.model.config.vision_config.attention_dropout)
+                },
+                method_replacement={"forward": forward_fn()},
+                sub_module_replacement=[],
+            )
+        elif use_zbv:
+            policy[SamVisionLayer] = ModulePolicyDescription(
+                sub_module_replacement=[
+                    SubModuleReplacementDescription(
+                        suffix="attn.qkv",
+                        target_module=col_nn.FusedLinear,
+                        kwargs={
+                            "split_sizes": [self.model.config.vision_config.hidden_size] * 3,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attn.proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.lin1",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.lin2",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                ],
+            )
+            policy[SamTwoWayAttentionBlock] = ModulePolicyDescription(
+                attribute_replacement={
+                    "self_attn.num_attention_heads": self.model.config.mask_decoder_config.num_attention_heads
+                    // self.shard_config.tensor_parallel_size,
+                },
+                sub_module_replacement=[
+                    SubModuleReplacementDescription(
+                        suffix="self_attn.q_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="self_attn.k_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="self_attn.v_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="self_attn.out_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="cross_attn_token_to_image.q_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="cross_attn_token_to_image.k_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="cross_attn_token_to_image.v_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="cross_attn_token_to_image.out_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.lin1",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.lin2",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="cross_attn_image_to_token.q_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="cross_attn_image_to_token.k_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="cross_attn_image_to_token.v_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="cross_attn_image_to_token.out_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                ],
+            )
+            policy[SamTwoWayTransformer] = ModulePolicyDescription(
+                sub_module_replacement=[
+                    SubModuleReplacementDescription(
+                        suffix="final_attn_token_to_image.q_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="final_attn_token_to_image.k_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="final_attn_token_to_image.v_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="final_attn_token_to_image.out_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                 ],
             )
@@ -207,23 +498,6 @@ class SamPolicy(Policy):
             policy=policy,
             target_key=SamTwoWayTransformer,
         )
-
-        # use flash attention
-        if self.shard_config.enable_flash_attention:
-            self.append_or_create_method_replacement(
-                description={
-                    "forward": get_sam_flash_attention_forward(),
-                },
-                policy=policy,
-                target_key=SamAttention,
-            )
-            self.append_or_create_method_replacement(
-                description={
-                    "forward": get_sam_vision_flash_attention_forward(),
-                },
-                policy=policy,
-                target_key=SamVisionAttention,
-            )
 
         return policy
 

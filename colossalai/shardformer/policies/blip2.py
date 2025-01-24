@@ -3,6 +3,7 @@ import colossalai.shardformer.layer as col_nn
 from ..modeling.blip2 import (
     forward_fn,
     get_blip2_flash_attention_forward,
+    get_jit_fused_blip2_mlp_forward,
     get_jit_fused_blip2_QFormer_output_forward,
     get_jit_fused_blip2_QFormer_self_output_forward,
 )
@@ -17,22 +18,17 @@ class BlipPolicy(Policy):
         pass
 
     def preprocess(self):
-        # reshape the embedding layer
-        r"""
-        Reshape the Embedding layer to make the embedding dimension divisible by world_size
-        """
-        # TODO:
-        vocab_size = self.model.config.qformer_config.vocab_size
-        world_size = self.shard_config.tensor_parallel_size
-        if vocab_size % world_size != 0:
-            new_vocab_size = vocab_size + world_size - vocab_size % world_size
-            self.model.resize_token_embeddings(new_vocab_size)
+        self.tie_weight = self.tie_weight_check()
+        self.enable_bias_gelu_fused = (
+            self.shard_config.enable_jit_fused and self.model.config.vision_config.hidden_act == "gelu"
+        )
         return self.model
 
     def module_policy(self):
         from transformers.models.blip_2.modeling_blip_2 import (
             Blip2Attention,
             Blip2EncoderLayer,
+            Blip2MLP,
             Blip2QFormerLayer,
             Blip2QFormerModel,
             Blip2QFormerOutput,
@@ -43,12 +39,24 @@ class BlipPolicy(Policy):
 
         policy = {}
 
+        embedding_cls = None
+        if self.shard_config.enable_tensor_parallelism:
+            embedding_cls = col_nn.VocabParallelEmbedding1D
+        else:
+            if self.tie_weight:
+                embedding_cls = col_nn.PaddingEmbedding
+
         if self.shard_config.enable_fused_normalization:
             norm_cls = col_nn.FusedLayerNorm
         else:
             norm_cls = col_nn.LayerNorm
 
+        use_zbv = self.pipeline_stage_manager is not None and self.pipeline_stage_manager.use_zbv
+
         if self.shard_config.enable_tensor_parallelism:
+            assert (
+                self.model.config.vision_config.num_attention_heads % self.shard_config.tensor_parallel_size == 0
+            ), f"The number of attention heads must be divisible by tensor parallel size."
             policy[Blip2EncoderLayer] = ModulePolicyDescription(
                 attribute_replacement={
                     "self_attn.num_heads": self.model.config.vision_config.num_attention_heads
@@ -65,20 +73,35 @@ class BlipPolicy(Policy):
                         suffix="self_attn.qkv",
                         target_module=col_nn.FusedLinear1D_Col,
                         kwargs={
-                            "n_fused": 3,
+                            "split_sizes": [self.model.config.vision_config.hidden_size] * 3,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
                         },
                     ),
                     SubModuleReplacementDescription(
                         suffix="self_attn.projection",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="mlp.fc1",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "skip_bias_add": self.enable_bias_gelu_fused,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="mlp.fc2",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                 ],
             )
@@ -107,14 +130,26 @@ class BlipPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="attention.attention.query",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="attention.attention.key",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="attention.attention.value",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="attention.attention.dropout",
@@ -123,6 +158,10 @@ class BlipPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="attention.output.dense",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="attention.output.dropout",
@@ -131,14 +170,26 @@ class BlipPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="crossattention.attention.query",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="crossattention.attention.key",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="crossattention.attention.value",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="crossattention.attention.dropout",
@@ -147,6 +198,10 @@ class BlipPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="crossattention.output.dense",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="crossattention.output.dropout",
@@ -155,10 +210,18 @@ class BlipPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="intermediate_query.dense",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="output_query.dense",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="output_query.dropout",
@@ -178,46 +241,331 @@ class BlipPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="self_attn.q_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="self_attn.k_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="self_attn.v_proj",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="self_attn.out_proj",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="fc1",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="fc2",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                 ],
             )
 
-            policy[OPTForCausalLM] = ModulePolicyDescription(
+            policy[Blip2Attention] = ModulePolicyDescription(method_replacement={"forward": forward_fn()})
+            if self.enable_bias_gelu_fused:
+                self.append_or_create_method_replacement(
+                    description={
+                        "forward": get_jit_fused_blip2_mlp_forward(),
+                    },
+                    policy=policy,
+                    target_key=Blip2MLP,
+                )
+        elif use_zbv:
+            policy[Blip2EncoderLayer] = ModulePolicyDescription(
                 sub_module_replacement=[
                     SubModuleReplacementDescription(
-                        suffix="model.decoder.embed_tokens",
-                        target_module=col_nn.VocabParallelEmbedding1D,
+                        suffix="self_attn.dropout",
+                        target_module=col_nn.DropoutForParallelInput,
                     ),
                     SubModuleReplacementDescription(
-                        suffix="lm_head",
-                        target_module=col_nn.Linear1D_Col,
-                        kwargs={"gather_output": True},
+                        suffix="self_attn.qkv",
+                        target_module=col_nn.FusedLinear,
+                        kwargs={
+                            "split_sizes": [self.model.config.vision_config.hidden_size] * 3,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="self_attn.projection",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.fc1",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "skip_bias_add": self.enable_bias_gelu_fused,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.fc2",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                ],
+            )
+
+            policy[Blip2QFormerModel] = ModulePolicyDescription(
+                sub_module_replacement=[
+                    SubModuleReplacementDescription(
+                        suffix="dropout",
+                        target_module=col_nn.DropoutForParallelInput,
                     ),
                 ]
             )
 
-            policy[Blip2Attention] = ModulePolicyDescription(method_replacement={"forward": forward_fn()})
+            policy[Blip2QFormerLayer] = ModulePolicyDescription(
+                sub_module_replacement=[
+                    SubModuleReplacementDescription(
+                        suffix="attention.attention.query",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attention.attention.key",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attention.attention.value",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attention.attention.dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attention.output.dense",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attention.output.dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="crossattention.attention.query",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="crossattention.attention.key",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="crossattention.attention.value",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="crossattention.attention.dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="crossattention.output.dense",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="crossattention.output.dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="intermediate_query.dense",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="output_query.dense",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="output_query.dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                ],
+            )
 
+            policy[OPTDecoderLayer] = ModulePolicyDescription(
+                sub_module_replacement=[
+                    SubModuleReplacementDescription(
+                        suffix="self_attn.q_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="self_attn.k_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="self_attn.v_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="self_attn.out_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="fc1",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="fc2",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                ],
+            )
+
+            policy[Blip2Attention] = ModulePolicyDescription(method_replacement={"forward": forward_fn()})
+            if self.enable_bias_gelu_fused:
+                self.append_or_create_method_replacement(
+                    description={
+                        "forward": get_jit_fused_blip2_mlp_forward(),
+                    },
+                    policy=policy,
+                    target_key=Blip2MLP,
+                )
+
+        if embedding_cls is not None:
+            self.append_or_create_submodule_replacement(
+                description=[
+                    SubModuleReplacementDescription(
+                        suffix="model.decoder.embed_tokens",
+                        target_module=embedding_cls,
+                        kwargs=(
+                            {
+                                "make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by,
+                                "fp8_communication": self.shard_config.fp8_communication,
+                            }
+                            if self.shard_config.enable_tensor_parallelism
+                            else {"make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by}
+                        ),
+                    ),
+                ],
+                policy=policy,
+                target_key=OPTForCausalLM,
+            )
+
+        if self.shard_config.enable_tensor_parallelism:
+            self.append_or_create_submodule_replacement(
+                description=[
+                    SubModuleReplacementDescription(
+                        suffix="lm_head",
+                        target_module=col_nn.VocabParallelLMHead1D,
+                        kwargs={
+                            "gather_output": True,
+                            "make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                        },
+                    ),
+                ],
+                policy=policy,
+                target_key=OPTForCausalLM,
+            )
+        else:
+            self.append_or_create_submodule_replacement(
+                description=[
+                    SubModuleReplacementDescription(
+                        suffix="lm_head",
+                        target_module=col_nn.PaddingLMHead,
+                        kwargs={"make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by},
+                    ),
+                ],
+                policy=policy,
+                target_key=OPTForCausalLM,
+            )
         # optimization configuration
         # Handle Blip2EncoderLayer layer
         self.append_or_create_submodule_replacement(

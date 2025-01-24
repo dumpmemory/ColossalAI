@@ -28,7 +28,7 @@ default_inference_kwargs = {
     "calculate_loss": False,
     "all_classes": ["A", "B", "C", "D"],
     "language": LANGUAGE,
-    "pretrain": False,
+    "calculate_overall_loss": False,
     "max_new_tokens": 32,
 }
 
@@ -130,7 +130,7 @@ class SafetyBenchENDataset(BaseDataset):
     """
 
     @staticmethod
-    def load(path: str, logger: DistributedLogger, few_shot: bool) -> List[Dict]:
+    def load(path: str, logger: DistributedLogger, few_shot: bool, *args, **kwargs) -> List[Dict]:
         dataset = {"dev": {}, "test": {}}
         data_files = [os.path.join(path, file_name) for file_name in FILES]
         for file_path in data_files:

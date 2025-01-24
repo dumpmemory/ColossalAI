@@ -7,7 +7,8 @@
       "items": [
         "get_started/installation",
         "get_started/run_demo",
-        "get_started/reading_roadmap"
+        "get_started/reading_roadmap",
+        "get_started/bonus"
       ]
     },
     {
@@ -56,6 +57,7 @@
         "features/pipeline_parallel",
         "features/nvme_offload",
         "features/lazy_init",
+        "features/distributed_optimizers",
         "features/cluster_utils"
       ]
     },

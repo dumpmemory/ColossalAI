@@ -18,11 +18,11 @@ from transformers import (
 )
 
 import colossalai
+from colossalai.accelerator import get_accelerator
 from colossalai.booster import Booster
 from colossalai.booster.plugin import GeminiPlugin, HybridParallelPlugin, LowLevelZeroPlugin, TorchDDPPlugin
 from colossalai.cluster import DistCoordinator
 from colossalai.nn.optimizer import HybridAdam
-from colossalai.utils import get_current_device
 
 # ==============================
 # Prepare Hyperparameters
@@ -38,7 +38,7 @@ criterion = lambda x: x.loss
 
 
 def move_to_cuda(batch):
-    return {k: v.cuda() for k, v in batch.items()}
+    return {k: v.to(get_accelerator().get_current_device()) for k, v in batch.items()}
 
 
 @torch.no_grad()
@@ -59,7 +59,7 @@ def evaluate_model(
         use_pipeline = isinstance(booster.plugin, HybridParallelPlugin) and booster.plugin.pp_size > 1
         is_pp_last_device = use_pipeline and booster.plugin.stage_manager.is_last_stage(ignore_chunk=True)
 
-        accum_loss = torch.zeros(1, device=get_current_device())
+        accum_loss = torch.zeros(1, device=get_accelerator().get_current_device())
         for batch in dataloader:
             batch = move_to_cuda(batch)
             labels = batch["labels"]
@@ -89,8 +89,10 @@ def evaluate_model(
                     object_list = [None, None]
                     dist.broadcast_object_list(object_list, src=current_pp_group_ranks[-1], group=pp_group)
 
-                    metric.add_batch(predictions=object_list[0].to(get_current_device()), references=labels)
-                    accum_loss.add_(object_list[1].to(get_current_device()))
+                    metric.add_batch(
+                        predictions=object_list[0].to(get_accelerator().get_current_device()), references=labels
+                    )
+                    accum_loss.add_(object_list[1].to(get_accelerator().get_current_device()))
 
             else:
                 batch = move_to_cuda(batch)
@@ -146,7 +148,7 @@ def train_epoch(
         for _ in pbar:
             if use_pipeline:
                 outputs = booster.execute_pipeline(
-                    train_dataloader_iter, model, _criterion, optimizer, return_loss=True, return_outputs=True
+                    train_dataloader_iter, model, _criterion, optimizer, return_loss=True
                 )
                 # Backward and optimize
                 if is_pp_last_device:
@@ -177,7 +179,7 @@ def main():
         "--plugin",
         type=str,
         default="torch_ddp",
-        choices=["torch_ddp", "torch_ddp_fp16", "gemini", "low_level_zero", "hybrid_parallel"],
+        choices=["torch_ddp", "torch_ddp_fp16", "gemini", "low_level_zero", "hybrid_parallel", "torch_fsdp"],
         help="plugin to use",
     )
     parser.add_argument(
@@ -188,6 +190,7 @@ def main():
     )
     parser.add_argument("--target_f1", type=float, default=None, help="target f1 score. Raise exception if not reached")
     parser.add_argument("--use_lazy_init", type=bool, default=False, help="for initiating lazy init context")
+    parser.add_argument("--use_fp8_comm", type=bool, default=False, help="for using fp8 during communication")
     args = parser.parse_args()
 
     if args.model_type == "bert":
@@ -200,7 +203,7 @@ def main():
     # ==============================
     # Launch Distributed Environment
     # ==============================
-    colossalai.launch_from_torch(config={}, seed=42)
+    colossalai.launch_from_torch(seed=42)
     coordinator = DistCoordinator()
 
     lr = LEARNING_RATE * coordinator.world_size
@@ -212,9 +215,9 @@ def main():
     if args.plugin == "torch_ddp_fp16":
         booster_kwargs["mixed_precision"] = "fp16"
     if args.plugin.startswith("torch_ddp"):
-        plugin = TorchDDPPlugin()
+        plugin = TorchDDPPlugin(fp8_communication=args.use_fp8_comm)
     elif args.plugin == "gemini":
-        plugin = GeminiPlugin(initial_scale=2**5)
+        plugin = GeminiPlugin(initial_scale=2**5, fp8_communication=args.use_fp8_comm)
     elif args.plugin == "low_level_zero":
         plugin = LowLevelZeroPlugin(initial_scale=2**5)
     elif args.plugin == "hybrid_parallel":
@@ -230,6 +233,18 @@ def main():
             zero_stage=1,
             precision="fp16",
             initial_scale=1,
+            fp8_communication=args.use_fp8_comm,
+        )
+    elif args.plugin == "torch_fsdp":
+        from torch.distributed.fsdp.fully_sharded_data_parallel import MixedPrecision
+
+        from colossalai.booster.plugin import TorchFSDPPlugin
+
+        plugin = TorchFSDPPlugin(
+            mixed_precision=MixedPrecision(
+                param_dtype=torch.float16, reduce_dtype=torch.float16, buffer_dtype=torch.float16
+            ),
+            fp8_communication=args.use_fp8_comm,
         )
 
     booster = Booster(plugin=plugin, **booster_kwargs)
@@ -251,7 +266,8 @@ def main():
     cfg = AutoConfig.from_pretrained(model_name, num_labels=data_builder.num_labels)
 
     if model_name == "bert-base-uncased":
-        model = BertForSequenceClassification.from_pretrained(model_name, config=cfg).cuda()
+        model = BertForSequenceClassification.from_pretrained(model_name, config=cfg)
+        model = model.to(get_accelerator().get_current_device())
     elif model_name == "albert-xxlarge-v2":
         model = AlbertForSequenceClassification.from_pretrained(model_name, config=cfg)
     else:

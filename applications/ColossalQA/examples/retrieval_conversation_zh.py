@@ -1,6 +1,7 @@
 """
 Script for Chinese retrieval based conversation system backed by ChatGLM
 """
+
 import argparse
 import os
 
@@ -107,7 +108,7 @@ if __name__ == "__main__":
             query=user_input,
             stop=["</答案>"],
             doc_prefix="支持文档",
-            rejection_trigger_keywrods=ZH_RETRIEVAL_QA_TRIGGER_KEYWORDS,
+            rejection_trigger_keywords=ZH_RETRIEVAL_QA_TRIGGER_KEYWORDS,
             rejection_answer=ZH_RETRIEVAL_QA_REJECTION_ANSWER,
         )
         print(f"Agent: {agent_response}")

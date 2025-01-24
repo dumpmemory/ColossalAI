@@ -3,14 +3,20 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.nn import CrossEntropyLoss
-from torch.utils.checkpoint import checkpoint
 from transformers.modeling_outputs import (
     BaseModelOutput,
     BaseModelOutputWithPastAndCrossAttentions,
     Seq2SeqLMOutput,
     Seq2SeqModelOutput,
+    TokenClassifierOutput,
 )
-from transformers.models.t5.modeling_t5 import T5EncoderModel, T5ForConditionalGeneration, T5Model, T5Stack
+from transformers.models.t5.modeling_t5 import (
+    T5EncoderModel,
+    T5ForConditionalGeneration,
+    T5ForTokenClassification,
+    T5Model,
+    T5Stack,
+)
 from transformers.utils import logging
 
 from colossalai.pipeline.stage_manager import PipelineStageManager
@@ -77,7 +83,7 @@ class T5PipelineForwards:
         if in_decoder != (stage >= decoder_starting_stage):
             raise ValueError("Config in T5Stack is not aligned with pipeline setting.")
 
-        # at_first_stage: current stage is the first stage of encoder/decoder, taking input_ids/input_embedds
+        # at_first_stage: current stage is the first stage of encoder/decoder, taking input_ids/input_embeds
         # at_last_stage: current stage is the last stage of encoder/decoder, making outputs the same form as huggingface
         at_first_stage = (stage == 0) or (stage == decoder_starting_stage)
         at_last_stage = (stage == decoder_starting_stage - 1) or (stage == stage_manager.num_stages - 1)
@@ -118,15 +124,12 @@ class T5PipelineForwards:
         # required mask seq length can be calculated via length of past
         mask_seq_length = past_key_values[0][0].shape[2] + seq_length if past_key_values is not None else seq_length
 
-        if attention_mask is None:
-            attention_mask = torch.ones(batch_size, mask_seq_length, device=device)
-        if in_decoder and encoder_attention_mask is None and encoder_hidden_states is not None:
-            encoder_seq_length = encoder_hidden_states.shape[1]
-            encoder_attention_mask = torch.ones(batch_size, encoder_seq_length, device=device, dtype=torch.long)
-
         # initialize past_key_values with `None` if past does not exist
         if past_key_values is None:
             past_key_values = [None] * len(self.block)
+
+        if attention_mask is None:
+            attention_mask = torch.ones(batch_size, mask_seq_length, device=device)
 
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
@@ -138,7 +141,7 @@ class T5PipelineForwards:
             encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
             encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
             if encoder_attention_mask is None:
-                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=inputs_embeds.device)
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=inputs_embeds.device, dtype=torch.long)
             encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
         else:
             encoder_extended_attention_mask = None
@@ -162,15 +165,8 @@ class T5PipelineForwards:
             torch.cuda.set_device(hidden_states.device)
 
             if self.gradient_checkpointing and self.training:
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return tuple(module(*inputs, use_cache, output_attentions))
-
-                    return custom_forward
-
-                layer_outputs = checkpoint(
-                    create_custom_forward(layer_module),
+                layer_outputs = self._gradient_checkpointing_func(
+                    layer_module.forward,
                     hidden_states,
                     extended_attention_mask,
                     position_bias,
@@ -180,6 +176,8 @@ class T5PipelineForwards:
                     layer_head_mask,
                     cross_attn_layer_head_mask,
                     None,  # past_key_value is always None with gradient checkpointing
+                    use_cache,
+                    output_attentions,
                 )
             else:
                 layer_outputs = layer_module(
@@ -591,12 +589,73 @@ class T5PipelineForwards:
 
         return outputs
 
+    @staticmethod
+    def t5_for_token_classification_forward(
+        self: T5ForTokenClassification,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        stage_manager: Optional[PipelineStageManager] = None,
+        hidden_states: Optional[torch.FloatTensor] = None,
+        position_bias: Optional[torch.Tensor] = None,
+        encoder_decoder_position_bias: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        backward_tensor_keys: Optional[List[str]] = None,
+        stage_index: Optional[List[int]] = None,
+        decoder_starting_stage: Optional[int] = None,
+    ) -> Union[Tuple[torch.FloatTensor], BaseModelOutput]:
+        r"""
+        This function is modified on the basis of transformers.models.t5.modeling_t5.T5ForTokenClassification.forward.
+        Please refer to original code of transformers for more details.
+        ```"""
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = T5PipelineForwards.t5_stack_forward(
+            self.transformer.encoder,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            stage_manager=stage_manager,
+            hidden_states=hidden_states,
+            position_bias=position_bias,
+            encoder_decoder_position_bias=encoder_decoder_position_bias,
+            stage_index=stage_index,
+            decoder_starting_stage=decoder_starting_stage,
+        )
+        if stage_manager.is_last_stage():
+            sequence_output = outputs[0]
+
+            sequence_output = self.dropout(sequence_output)
+            logits = self.classifier(sequence_output)
+
+            loss = None
+            if labels is not None:
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+            if not return_dict:
+                output = (logits,) + outputs[2:]
+                return ((loss,) + output) if loss is not None else output
+
+            return TokenClassifierOutput(
+                loss=loss,
+                logits=logits,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+
+        return outputs
+
 
 def get_t5_flash_attention_forward():
-    try:
-        from xformers.ops import memory_efficient_attention as me_attention
-    except:
-        raise ImportError("Error: xformers module is not installed. Please install it to use flash attention.")
     from transformers.models.t5.modeling_t5 import T5Attention
 
     def forward(
@@ -632,11 +691,11 @@ def get_t5_flash_attention_forward():
 
         def shape(states):
             """projection"""
-            return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim)
+            return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
 
         def unshape(states):
             """reshape"""
-            return states.view(batch_size, -1, self.inner_dim)
+            return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim)
 
         def project(hidden_states, proj_layer, key_value_states, past_key_value):
             """projects hidden states correctly to key/query states"""
@@ -653,8 +712,8 @@ def get_t5_flash_attention_forward():
                 if key_value_states is None:
                     # self-attn
                     # (batch_size, n_heads, key_length, dim_per_head)
-                    hidden_states = torch.cat([past_key_value, hidden_states], dim=1)
-                elif past_key_value.shape[1] != key_value_states.shape[1]:
+                    hidden_states = torch.cat([past_key_value, hidden_states], dim=2)
+                elif past_key_value.shape[2] != key_value_states.shape[1]:
                     # checking that the `sequence_length` of the `past_key_value` is the same as
                     # the provided `key_value_states` to support prefix tuning
                     # cross-attn
@@ -701,10 +760,15 @@ def get_t5_flash_attention_forward():
         else:
             position_bias_masked = position_bias
 
-        position_bias_masked = position_bias_masked.contiguous()
-        attn_output = me_attention(
-            query_states, key_states, value_states, attn_bias=position_bias_masked, p=self.dropout, scale=1.0
-        )
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True):
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=position_bias_masked,
+                dropout_p=self.dropout,
+                scale=1.0,
+            )
         attn_output = unshape(attn_output)
         attn_output = self.o(attn_output)
 

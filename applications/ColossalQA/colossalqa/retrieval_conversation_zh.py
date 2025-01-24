@@ -1,6 +1,7 @@
 """
 Script for Chinese retrieval based conversation system backed by ChatGLM
 """
+
 from typing import Tuple
 
 from colossalqa.chain.retrieval_qa.base import RetrievalQA
@@ -87,7 +88,7 @@ class ChineseRetrievalConversation:
                 query=user_input,
                 stop=["</答案>"],
                 doc_prefix="支持文档",
-                rejection_trigger_keywrods=["无法回答该问题"],
+                rejection_trigger_keywords=["无法回答该问题"],
                 rejection_answer="抱歉，根据提供的信息无法回答该问题。",
             ).split("\n")[0],
             self.memory,

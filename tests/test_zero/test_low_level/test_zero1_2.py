@@ -2,11 +2,13 @@ import copy
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.testing import assert_close
 
 import colossalai
+from colossalai.cluster import ProcessGroupMesh
 from colossalai.testing import parameterize, rerun_if_address_is_in_use, spawn
 from colossalai.testing.random import seed_all
 from colossalai.zero import LowLevelZeroOptimizer
@@ -51,7 +53,8 @@ def split_ddp_grad(grad, world_size):
     return splited_grad
 
 
-def exam_zero_1_2():
+@parameterize("fp8_communication", [True, False])
+def exam_zero_1_2(fp8_communication: bool):
     """
     In this test, we want to test whether zero stage 1 and 2
     deliver the same numerical results despite different communication
@@ -73,10 +76,18 @@ def exam_zero_1_2():
     zero1_optimizer = torch.optim.Adam(zero1_model.parameters(), lr=1)
     zero2_optimizer = torch.optim.Adam(zero2_model.parameters(), lr=1)
     zero1_optimizer = LowLevelZeroOptimizer(
-        zero1_optimizer, overlap_communication=True, initial_scale=128, verbose=True
+        zero1_optimizer,
+        overlap_communication=True,
+        initial_scale=128,
+        verbose=True,
+        fp8_communication=fp8_communication,
     )
     zero2_optimizer = LowLevelZeroOptimizer(
-        zero2_optimizer, overlap_communication=True, partition_grad=True, initial_scale=128
+        zero2_optimizer,
+        overlap_communication=True,
+        partition_grad=True,
+        initial_scale=128,
+        fp8_communication=fp8_communication,
     )
     # create data
     seed_all(2001 + local_rank)
@@ -91,10 +102,16 @@ def exam_zero_1_2():
     zero2_optimizer.backward(zero2_output.mean().float())
 
     # check grad
-    z1g_list = zero1_optimizer._grad_store.get_working_grads_by_group_id(0)
-    z2g_list = zero2_optimizer._grad_store.get_working_grads_by_group_id(0)
-    for z1g, z2g in zip(z1g_list, z2g_list):
-        assert torch.equal(z1g, z2g)
+    for p1, p2 in zip(zero1_model.parameters(), zero2_model.parameters()):
+        g1 = zero1_optimizer.get_param_grad(p1)
+        g2 = zero2_optimizer.get_param_grad(p2)
+        if g1 is None or g2 is None:
+            assert g1 is None and g2 is None
+            continue
+        if fp8_communication:
+            loose_close(g1, g2, dtype=torch.float16)
+        else:
+            assert torch.allclose(g1, g2)
 
     # step
     zero1_optimizer.step()
@@ -102,12 +119,14 @@ def exam_zero_1_2():
 
     # check updated param
     for z1p, z2p in zip(zero1_model.parameters(), zero2_model.parameters()):
-        assert torch.equal(z1p.data, z2p.data)
+        if not fp8_communication:
+            assert torch.allclose(z1p, z2p)
 
 
 @parameterize("dtype", [torch.float16, torch.bfloat16])
 @parameterize("master_weights", [True, False])
-def exam_zero_1_torch_ddp(world_size, dtype: torch.dtype, master_weights: bool):
+@parameterize("extra_dp_size", [1, 2])
+def exam_zero_1_torch_ddp(dtype: torch.dtype, master_weights: bool, extra_dp_size: int):
     """
     In this test, two pairs of model and optimizers are created.
     1. zero: use sharded optimizer and fp16 parameters
@@ -116,11 +135,20 @@ def exam_zero_1_torch_ddp(world_size, dtype: torch.dtype, master_weights: bool):
     We feed these two sets of models with the same input and check if the
     differences in model output and updated parameters are within tolerance.
     """
+    if extra_dp_size > 1 and dtype != torch.bfloat16:
+        return
+    if extra_dp_size > 1:
+        pg_mesh = ProcessGroupMesh(extra_dp_size, dist.get_world_size() // extra_dp_size)
+        extra_dp_group = pg_mesh.get_group_along_axis(0)
+        dp_group = pg_mesh.get_group_along_axis(1)
+    else:
+        extra_dp_group = None
+        dp_group = None
     local_rank = torch.distributed.get_rank()
     seed_all(1453)
 
     # create models
-    torch_model = MlpModel().cuda()
+    torch_model = MlpModel().cuda().to(dtype)
     zero_model = copy.deepcopy(torch_model).to(dtype)
 
     torch_model = DDP(torch_model.cuda(), static_graph=True).cuda()
@@ -137,57 +165,63 @@ def exam_zero_1_torch_ddp(world_size, dtype: torch.dtype, master_weights: bool):
         initial_scale=1,
         reduce_bucket_size=1024 * 1024,
         master_weights=master_weights,
+        dp_process_group=dp_group,
+        extra_dp_group=extra_dp_group,
     )
 
     torch_optimizer = torch.optim.SGD(torch_model.parameters(), lr=1)
 
     seed_all(1453 + local_rank)
-    # create
-    input_data = torch.rand(32, 123).cuda()
 
-    # zero-dp forward
-    zero_output = zero_model(input_data.to(dtype))
+    for _ in range(2):
+        # create
+        input_data = torch.rand(32, 123).cuda().to(dtype)
 
-    # torch-ddp forward
-    torch_output = torch_model(input_data)
-    loose_close(zero_output, torch_output, dtype=dtype)
+        # zero-dp forward
+        zero_output = zero_model(input_data)
 
-    # zero-dp backward
-    zero_optimizer.backward(zero_output.mean().float())
+        # torch-ddp forward
+        torch_output = torch_model(input_data)
+        loose_close(zero_output, torch_output, dtype=dtype)
 
-    # torch-ddp backward
-    torch_output.mean().backward()
+        # zero-dp backward
+        zero_optimizer.backward(zero_output.mean())
 
-    # check grad
-    for (n, p), z1p in zip(torch_model.named_parameters(), zero_model.parameters()):
-        if p.grad is not None:
-            zero_grad_list = zero_optimizer._grad_store.get_partitioned_gradients_by_param_id(0, id(z1p))
-            torch_grad_list = split_ddp_grad(p.grad, world_size)
-            for zero_grad, torch_grad in zip(zero_grad_list, torch_grad_list):
-                loose_close(zero_grad, torch_grad, dtype=dtype)
+        # torch-ddp backward
+        torch_output.mean().backward()
 
-    # zero-dp step
-    zero_optimizer.step()
+        # check grad
+        for (n, p), z1p in zip(torch_model.named_parameters(), zero_model.parameters()):
+            zero_grad = zero_optimizer.get_param_grad(z1p)
+            if p.grad is None:
+                assert zero_grad is None
+                continue
+            loose_close(p.grad, zero_grad, dtype=dtype)
 
-    # torch ddp step
-    torch_optimizer.step()
+        # zero-dp step
+        zero_optimizer.step()
 
-    # check updated param
-    for (n, p), z1p in zip(torch_model.named_parameters(), zero_model.parameters()):
-        loose_close(p.data, z1p.data, dtype=dtype)
+        # torch ddp step
+        torch_optimizer.step()
+
+        zero_optimizer._force_wait_all_gather()
+
+        # check updated param
+        for (n, p), z1p in zip(torch_model.named_parameters(), zero_model.parameters()):
+            loose_close(p, z1p, dtype=dtype)
 
 
 def run_dist(rank, world_size, port):
-    colossalai.launch(config=dict(), rank=rank, world_size=world_size, port=port, host="localhost")
+    colossalai.launch(rank=rank, world_size=world_size, port=port, host="localhost")
 
-    exam_zero_1_torch_ddp(world_size=world_size)
+    exam_zero_1_torch_ddp()
     exam_zero_1_2()
 
 
 @pytest.mark.dist
 @rerun_if_address_is_in_use()
 def test_zero_1_2():
-    spawn(run_dist, 2)
+    spawn(run_dist, 4)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,3 @@
-import math
 import warnings
 from typing import List, Optional, Tuple, Union
 
@@ -186,13 +185,20 @@ class BertPipelineForwards:
         # split the input tensor along sequence dimension
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len/TP_size, hidden_size]
         if shard_config is not None and shard_config.enable_sequence_parallelism:
-            hidden_states = split_forward_gather_backward(
-                hidden_states, dim=1, process_group=shard_config.tensor_parallel_process_group
-            )
-            if encoder_hidden_states is not None:
-                encoder_hidden_states = split_forward_gather_backward(
-                    encoder_hidden_states, dim=1, process_group=shard_config.tensor_parallel_process_group
+            if shard_config.sequence_parallelism_mode == "split_gather":
+                hidden_states = split_forward_gather_backward(
+                    hidden_states,
+                    dim=1,
+                    process_group=shard_config.tensor_parallel_process_group,
+                    fp8_communication=shard_config.fp8_communication,
                 )
+                if encoder_hidden_states is not None:
+                    encoder_hidden_states = split_forward_gather_backward(
+                        encoder_hidden_states,
+                        dim=1,
+                        process_group=shard_config.tensor_parallel_process_group,
+                        fp8_communication=shard_config.fp8_communication,
+                    )
 
         for idx, encoder_layer in enumerate(self.encoder.layer[start_idx:end_idx], start=start_idx):
             if stage_manager.is_first_stage() and idx == 0:
@@ -240,9 +246,13 @@ class BertPipelineForwards:
 
         # When sequence parallelism done, gather the output tensor in forward and split it in backward
         if shard_config is not None and shard_config.enable_sequence_parallelism:
-            hidden_states = gather_forward_split_backward(
-                hidden_states, dim=1, process_group=shard_config.tensor_parallel_process_group
-            )
+            if shard_config.sequence_parallelism_mode == "split_gather":
+                hidden_states = gather_forward_split_backward(
+                    hidden_states,
+                    dim=1,
+                    process_group=shard_config.tensor_parallel_process_group,
+                    fp8_communication=shard_config.fp8_communication,
+                )
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -1003,115 +1013,6 @@ class BertPipelineForwards:
             return {"hidden_states": hidden_states}
 
 
-def get_bert_flash_attention_forward():
-    try:
-        from xformers.ops import memory_efficient_attention as me_attention
-    except:
-        raise ImportError("Error: xformers module is not installed. Please install it to use flash attention.")
-    from transformers.models.bert.modeling_bert import BertAttention
-
-    def forward(
-        self: BertAttention,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        output_attentions: Optional[bool] = False,
-    ) -> Tuple[torch.Tensor]:
-        mixed_query_layer = self.query(hidden_states)
-
-        # If this is instantiated as a cross-attention module, the keys
-        # and values come from an encoder; the attention mask needs to be
-        # such that the encoder's padding tokens are not attended to.
-        is_cross_attention = encoder_hidden_states is not None
-
-        if is_cross_attention and past_key_value is not None:
-            # reuse k,v, cross_attentions
-            key_layer = past_key_value[0]
-            value_layer = past_key_value[1]
-            attention_mask = encoder_attention_mask
-        elif is_cross_attention:
-            key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
-            value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
-            attention_mask = encoder_attention_mask
-        elif past_key_value is not None:
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
-            key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
-            value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
-        else:
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
-
-        query_layer = self.transpose_for_scores(mixed_query_layer)
-
-        use_cache = past_key_value is not None
-        if self.is_decoder:
-            # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
-            # Further calls to cross_attention layer can then reuse all cross-attention
-            # key/value_states (first "if" case)
-            # if uni-directional self-attention (decoder) save Tuple(torch.Tensor, torch.Tensor) of
-            # all previous decoder key/value_states. Further calls to uni-directional self-attention
-            # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
-            # if encoder bi-directional self-attention `past_key_value` is always `None`
-            past_key_value = (key_layer, value_layer)
-
-        final_attention_mask = None
-        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
-            query_length, key_length = query_layer.shape[2], key_layer.shape[2]
-            if use_cache:
-                position_ids_l = torch.tensor(key_length - 1, dtype=torch.long, device=hidden_states.device).view(-1, 1)
-            else:
-                position_ids_l = torch.arange(query_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
-            position_ids_r = torch.arange(key_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
-            distance = position_ids_l - position_ids_r
-
-            positional_embedding = self.distance_embedding(distance + self.max_position_embeddings - 1)
-            positional_embedding = positional_embedding.to(dtype=query_layer.dtype)  # fp16 compatibility
-
-            if self.position_embedding_type == "relative_key":
-                relative_position_scores = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
-                final_attention_mask = relative_position_scores
-            elif self.position_embedding_type == "relative_key_query":
-                relative_position_scores_query = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
-                relative_position_scores_key = torch.einsum("bhrd,lrd->bhlr", key_layer, positional_embedding)
-                final_attention_mask = relative_position_scores_query + relative_position_scores_key
-
-        scale = 1 / math.sqrt(self.attention_head_size)
-        if attention_mask is not None:
-            if final_attention_mask != None:
-                final_attention_mask = final_attention_mask * scale + attention_mask
-            else:
-                final_attention_mask = attention_mask
-
-        if final_attention_mask is not None:
-            batch_size, src_len = query_layer.size()[0], query_layer.size()[2]
-            tgt_len = key_layer.size()[2]
-            final_attention_mask = final_attention_mask.expand(
-                batch_size, self.num_attention_heads, src_len, tgt_len
-            ).contiguous()
-
-        query_layer = query_layer.permute(0, 2, 1, 3).contiguous()
-        key_layer = key_layer.permute(0, 2, 1, 3).contiguous()
-        value_layer = value_layer.permute(0, 2, 1, 3).contiguous()
-
-        context_layer = me_attention(
-            query_layer, key_layer, value_layer, attn_bias=final_attention_mask, p=self.dropout.p, scale=scale
-        )
-        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
-        context_layer = context_layer.view(new_context_layer_shape)
-
-        outputs = (context_layer, None)
-
-        if self.is_decoder:
-            outputs = outputs + (past_key_value,)
-        return outputs
-
-    return forward
-
-
 def get_jit_fused_bert_self_output_forward():
     from transformers.models.bert.modeling_bert import BertSelfOutput
 
@@ -1243,11 +1144,17 @@ def bert_sequence_parallel_forward_fn(shard_config: ShardConfig):
         # split the input tensor along sequence dimension
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len/TP_size, hidden_size]
         embedding_output = split_forward_gather_backward(
-            embedding_output, dim=1, process_group=shard_config.tensor_parallel_process_group
+            embedding_output,
+            dim=1,
+            process_group=shard_config.tensor_parallel_process_group,
+            fp8_communication=shard_config.fp8_communication,
         )
         if encoder_hidden_states is not None:
             encoder_hidden_states = split_forward_gather_backward(
-                encoder_hidden_states, dim=1, process_group=shard_config.tensor_parallel_process_group
+                encoder_hidden_states,
+                dim=1,
+                process_group=shard_config.tensor_parallel_process_group,
+                fp8_communication=shard_config.fp8_communication,
             )
 
         encoder_outputs = self.encoder(
@@ -1267,7 +1174,10 @@ def bert_sequence_parallel_forward_fn(shard_config: ShardConfig):
 
         # When sequence parallelism done, gather the output tensor in forward and split it in backward
         sequence_output = gather_forward_split_backward(
-            sequence_output, dim=1, process_group=shard_config.tensor_parallel_process_group
+            sequence_output,
+            dim=1,
+            process_group=shard_config.tensor_parallel_process_group,
+            fp8_communication=shard_config.fp8_communication,
         )
 
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
@@ -1283,5 +1193,18 @@ def bert_sequence_parallel_forward_fn(shard_config: ShardConfig):
             attentions=encoder_outputs.attentions,
             cross_attentions=encoder_outputs.cross_attentions,
         )
+
+    return forward
+
+
+def get_jit_fused_bert_intermediate_forward():
+    from transformers.models.bert.modeling_bert import BertIntermediate
+
+    from colossalai.kernel.jit.bias_gelu import GeLUFunction as JitGeLUFunction
+
+    def forward(self: BertIntermediate, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, bias = self.dense(hidden_states)
+        hidden_states = JitGeLUFunction.apply(hidden_states, bias)
+        return hidden_states
 
     return forward

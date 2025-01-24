@@ -1,20 +1,20 @@
 import pytest
 
 import colossalai
+from colossalai.accelerator import get_accelerator
 from colossalai.legacy.utils.memory import colo_device_memory_capacity, colo_set_process_memory_fraction
 from colossalai.testing import spawn
-from colossalai.utils.device import get_current_device
 
 
 def _run_colo_set_process_memory_fraction_and_colo_device_memory_capacity():
-    frac1 = colo_device_memory_capacity(get_current_device())
+    frac1 = colo_device_memory_capacity(get_accelerator().get_current_device())
     colo_set_process_memory_fraction(0.5)
-    frac2 = colo_device_memory_capacity(get_current_device())
+    frac2 = colo_device_memory_capacity(get_accelerator().get_current_device())
     assert frac2 * 2 == frac1
 
 
 def run_dist(rank, world_size, port):
-    colossalai.legacy.launch(config={}, rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
+    colossalai.legacy.launch(rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
     _run_colo_set_process_memory_fraction_and_colo_device_memory_capacity()
 
 

@@ -7,9 +7,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.testing import assert_close
 
 import colossalai
+from colossalai.accelerator import get_accelerator
 from colossalai.testing import spawn
 from colossalai.testing.random import seed_all
-from colossalai.utils import conditional_context, get_current_device
+from colossalai.utils import conditional_context
 from colossalai.zero import LowLevelZeroOptimizer
 
 
@@ -28,7 +29,7 @@ class MlpModel(nn.Module):
 def exam_zero_1_2_grad_acc():
     local_rank = torch.distributed.get_rank()
     seed_all(2009)
-    device = get_current_device()
+    device = get_accelerator().get_current_device()
     # create model
     zero1_model = MlpModel().to(device)
     zero2_model = copy.deepcopy(zero1_model)
@@ -63,15 +64,19 @@ def exam_zero_1_2_grad_acc():
     zero1_optimizer.step()
     zero2_optimizer.step()
 
+    zero1_optimizer._force_wait_all_gather()
+    zero2_optimizer._force_wait_all_gather()
+
     # check updated param
     for z1p, z2p in zip(zero1_model.parameters(), zero2_model.parameters()):
+        assert not hasattr(z1p, "_all_gather_handle")
         assert torch.equal(z1p.data, z2p.data)
 
 
 def exam_zero_1_grad_acc(sync):
     local_rank = torch.distributed.get_rank()
     seed_all(2008)
-    device = get_current_device()
+    device = get_accelerator().get_current_device()
 
     # create models
     zero_model = MlpModel()
@@ -129,7 +134,7 @@ def exam_zero_1_grad_acc(sync):
 
 
 def run_dist(rank, world_size, port):
-    colossalai.launch(config=dict(), rank=rank, world_size=world_size, port=port, host="localhost")
+    colossalai.launch(rank=rank, world_size=world_size, port=port, host="localhost")
 
     exam_zero_1_grad_acc(sync=True)
     exam_zero_1_grad_acc(sync=False)

@@ -1,3 +1,4 @@
+import copy
 import os
 from typing import Callable, Optional, Union
 
@@ -61,7 +62,6 @@ def new_from_pretrained(
     config = kwargs.pop("config", None)
     cache_dir = kwargs.pop("cache_dir", None)
     force_download = kwargs.pop("force_download", False)
-    resume_download = kwargs.pop("resume_download", False)
     proxies = kwargs.pop("proxies", None)
     local_files_only = kwargs.pop("local_files_only", False)
     use_auth_token = kwargs.pop("use_auth_token", None)
@@ -74,6 +74,24 @@ def new_from_pretrained(
     subfolder = kwargs.pop("subfolder", "")
     commit_hash = kwargs.pop("_commit_hash", None)
     variant = kwargs.pop("variant", None)
+
+    kwargs.pop("state_dict", None)
+    kwargs.pop("from_tf", False)
+    kwargs.pop("from_flax", False)
+    kwargs.pop("output_loading_info", False)
+    kwargs.pop("trust_remote_code", None)
+    kwargs.pop("low_cpu_mem_usage", None)
+    kwargs.pop("device_map", None)
+    kwargs.pop("max_memory", None)
+    kwargs.pop("offload_folder", None)
+    kwargs.pop("offload_state_dict", False)
+    kwargs.pop("load_in_8bit", False)
+    kwargs.pop("load_in_4bit", False)
+    kwargs.pop("quantization_config", None)
+    kwargs.pop("adapter_kwargs", {})
+    kwargs.pop("adapter_name", "default")
+    kwargs.pop("use_flash_attention_2", False)
+
     use_safetensors = kwargs.pop("use_safetensors", None if is_safetensors_available() else False)
 
     if len(kwargs) > 0:
@@ -97,7 +115,6 @@ def new_from_pretrained(
             cache_dir=cache_dir,
             return_unused_kwargs=True,
             force_download=force_download,
-            resume_download=resume_download,
             proxies=proxies,
             local_files_only=local_files_only,
             use_auth_token=use_auth_token,
@@ -108,6 +125,10 @@ def new_from_pretrained(
             **kwargs,
         )
     else:
+        config = copy.deepcopy(config)
+        kwarg_attn_imp = kwargs.pop("attn_implementation", None)
+        if kwarg_attn_imp is not None and config._attn_implementation != kwarg_attn_imp:
+            config._attn_implementation = kwarg_attn_imp
         model_kwargs = kwargs
 
     if commit_hash is None:
@@ -172,7 +193,6 @@ def new_from_pretrained(
                     "cache_dir": cache_dir,
                     "force_download": force_download,
                     "proxies": proxies,
-                    "resume_download": resume_download,
                     "local_files_only": local_files_only,
                     "use_auth_token": use_auth_token,
                     "user_agent": user_agent,
@@ -289,7 +309,6 @@ def new_from_pretrained(
                 pretrained_model_name_or_path,
                 cache_dir=cache_dir,
                 force_download=force_download,
-                resume_download=resume_download,
                 proxies=proxies,
                 local_files_only=local_files_only,
                 use_auth_token=use_auth_token,

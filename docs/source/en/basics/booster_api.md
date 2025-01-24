@@ -32,7 +32,7 @@ Plugin is an important component that manages parallel configuration (eg: The ge
 
 More details about usages of each plugin can be found in chapter [Booster Plugins](./booster_plugins.md).
 
-Some plugins support lazy initialization, which can be used to save memory when initializating large models. For more details, please see [Lazy Initialization](../features/lazy_init.md).
+Some plugins support lazy initialization, which can be used to save memory when initializing large models. For more details, please see [Lazy Initialization](../features/lazy_init.md).
 
 ### API of booster
 
@@ -55,7 +55,7 @@ from colossalai.booster.plugin import TorchDDPPlugin
 
 def train():
     # launch colossalai
-    colossalai.launch(config=dict(), rank=rank, world_size=world_size, port=port, host='localhost')
+    colossalai.launch(rank=rank, world_size=world_size, port=port, host='localhost')
 
     # create plugin and objects for training
     plugin = TorchDDPPlugin()

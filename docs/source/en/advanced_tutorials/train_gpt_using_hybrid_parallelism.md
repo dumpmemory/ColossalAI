@@ -45,7 +45,6 @@ from colossalai.booster import Booster
 from colossalai.booster.plugin import GeminiPlugin, HybridParallelPlugin, LowLevelZeroPlugin, TorchDDPPlugin
 from colossalai.cluster import DistCoordinator
 from colossalai.nn.optimizer import HybridAdam
-from colossalai.utils import get_current_device
 ```
 ## Define Plugin
 Create a `HybridParallelPlugin` object and specify the desired parallelism strategies to be used. In this example, both pipeline parallelism and ZeRO-1 are used simultaneously.
@@ -76,7 +75,7 @@ WARMUP_FRACTION = 0.1
 we create a distributed environment.
 ```python
 # Launch ColossalAI
-colossalai.launch_from_torch(config={}, seed=42)
+colossalai.launch_from_torch( seed=42)
 coordinator = DistCoordinator()
 ```
 prepare the dataset. You can use `plugin.prepare_dataloader` to generate a dataloader or customize your own dataloader.
@@ -149,7 +148,7 @@ model, optimizer, _criterion, _, lr_scheduler = booster.boost(
 
 ## Training GPT-2 using hybrid parallelism
 
-In the previous tutorial, We've explained how to inject various parallelism features into the model and its training components using the Booster and `HybridParallelPlugin`. Now we can start model training. 
+In the previous tutorial, We've explained how to inject various parallelism features into the model and its training components using the Booster and `HybridParallelPlugin`. Now we can start model training.
 Define a training function. When pipeline parallelism is used, you need to call `booster.execute_pipeline` to schedule the stages of model training.
 ```python
 def train_epoch(
@@ -179,7 +178,7 @@ def train_epoch(
         for _ in pbar:
             if use_pipeline:
                 outputs = booster.execute_pipeline(
-                    train_dataloader_iter, model, _criterion, optimizer, return_loss=True, return_outputs=True
+                    train_dataloader_iter, model, _criterion, optimizer, return_loss=True
                 )
                 # Backward and optimize
                 if is_pp_last_stage:

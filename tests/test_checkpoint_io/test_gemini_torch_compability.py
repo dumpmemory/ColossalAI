@@ -20,7 +20,7 @@ from tests.kit.model_zoo import model_zoo
 
 @clear_cache_before_run()
 @parameterize("shard", [False, True])
-@parameterize("model_name", ["transformers_llama_for_casual_lm"])
+@parameterize("model_name", ["transformers_llama_for_causal_lm"])
 def exam_torch_load_from_gemini(shard: bool, model_name: str):
     (model_fn, data_gen_fn, output_transform_fn, _, _) = next(iter(model_zoo.get_sub_registry(model_name).values()))
     criterion = lambda x: x.mean()
@@ -62,12 +62,12 @@ def exam_torch_load_from_gemini(shard: bool, model_name: str):
         check_state_dict_equal(
             model.state_dict(only_rank_0=False, prefix="module.module."),
             new_model.state_dict(),
-            False,
+            ignore_device=False,
             ignore_dtype=True,
         )
 
         new_booster.load_optimizer(new_optimizer, optimizer_ckpt_path)
-        check_state_dict_equal(optimizer.state_dict(only_rank_0=False), new_optimizer.state_dict(), False)
+        check_state_dict_equal(optimizer.state_dict(only_rank_0=False), new_optimizer.state_dict(), ignore_device=False)
 
         # Check the new model/optimizer can successfully run.
         data = data_gen_fn()
@@ -128,7 +128,7 @@ def exam_gemini_load_from_torch(shard: bool, model_name: str):
         check_state_dict_equal(
             new_model.state_dict(only_rank_0=False, prefix="module.module."),
             model.state_dict(),
-            False,
+            ignore_device=False,
             ignore_dtype=True,
         )
 
@@ -145,7 +145,7 @@ def exam_gemini_load_from_torch(shard: bool, model_name: str):
                     k in old_group and k in new_group
                 ), f"Old group's keys: {list(old_group.keys())}, New group's keys: {list(new_group.keys())}"
                 assert old_group[k] == new_group[k]
-        check_state_dict_equal(old_state_dict["state"], new_state_dict["state"], False)
+        check_state_dict_equal(old_state_dict["state"], new_state_dict["state"], ignore_device=False)
 
         # Check the new model/optimizer can successfully run.
         data = data_gen_fn()
@@ -163,8 +163,7 @@ def exam_gemini_load_from_torch(shard: bool, model_name: str):
 
 
 def run_dist(rank, world_size, port):
-    config = {}
-    colossalai.launch(config=config, rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
+    colossalai.launch(rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
     exam_torch_load_from_gemini()
     exam_gemini_load_from_torch()
 

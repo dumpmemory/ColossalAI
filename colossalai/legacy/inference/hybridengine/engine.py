@@ -42,11 +42,11 @@ class CaiInferEngine:
     import colossalai
     from transformers import LlamaForCausalLM, LlamaTokenizer
 
-    colossalai.launch_from_torch(config={})
+    colossalai.launch_from_torch()
 
     model = LlamaForCausalLM.from_pretrained("your_path_to_model")
     tokenizer = LlamaTokenizer.from_pretrained("/home/lczyh/share/models/llama-7b-hf")
-    # assume the model is infered with 2 pipeline stages
+    # assume the model is inferred with 2 pipeline stages
     inferengine = CaiInferEngine(pp_size=2, model=model, model_policy=LlamaModelInferPolicy())
 
     input = ["Introduce a landmark in China ","Introduce a landmark in China "]
@@ -70,7 +70,7 @@ class CaiInferEngine:
         max_input_len: int = 32,
         max_output_len: int = 32,
         verbose: bool = False,
-        # TODO: implement early_stopping, and various gerneration options
+        # TODO: implement early_stopping, and various generation options
         early_stopping: bool = False,
         do_sample: bool = False,
         num_beams: int = 1,
@@ -133,7 +133,7 @@ class CaiInferEngine:
         """
         assert isinstance(
             input_list, (BatchEncoding, dict)
-        ), f"Only accept BatchEncoding or dict as input, but get {input_list.__class__.__name__}."
+        ), f"Only accept BatchEncoding or dict as input, but got {input_list.__class__.__name__}."
         if isinstance(input_list, BatchEncoding):
             input_list = input_list.data
         out, timestamp = self.schedule.generate_step(self.model, iter([input_list]))

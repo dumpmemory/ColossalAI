@@ -1,31 +1,36 @@
 # coding=utf-8
+import concurrent.futures
 import os
 import re
 from collections import abc as container_abcs
 from collections import defaultdict
 from itertools import chain
 from pathlib import Path
-from typing import Iterator, List, Mapping, Optional, OrderedDict, Tuple
+from typing import Dict, Generator, Iterator, List, Mapping, Optional, OrderedDict, Tuple, Union
 
 import torch
 import torch.nn as nn
 from packaging.version import Version
 from torch.optim import Optimizer
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
+from colossalai.accelerator import get_accelerator
 from colossalai.tensor.d_tensor import (
     is_customized_distributed_tensor,
     is_distributed_tensor,
     to_global,
     to_global_for_customized_distributed_tensor,
 )
+from colossalai.utils.safetensors import _flatten_optim_state_dict, load_flat
 
 SAFE_WEIGHTS_NAME = "model.safetensors"
 WEIGHTS_NAME = "pytorch_model.bin"
 STATES_NAME = "pytorch_optim.bin"
+SAFE_STATE_NAME = "optimizer.safetensors"
 SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
 WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
 STATES_INDEX_NAME = "pytorch_optim.bin.index.json"
+SAFE_STATES_INDEX_NAME = "optimizer.safetensors.index.json"
 GROUP_FILE_NAME = "pytorch_optim_group.bin"
 
 # ======================================
@@ -118,6 +123,15 @@ def search_tp_partition_dim(current_shape: torch.Size, original_shape: torch.Siz
                 shape before sharding {original_shape}, shape after sharding {current_shape}"
 
     return partition_dim
+
+
+def search_padding_dim(global_shape: torch.Size, original_shape: torch.Size) -> Optional[int]:
+    padding_dim = None
+    for dim, length in enumerate(global_shape):
+        if length > original_shape[dim]:
+            padding_dim = dim
+            break
+    return padding_dim
 
 
 # ======================================
@@ -233,6 +247,7 @@ def save_state_dict_shards(
     shard_filenames = []
     for idx, shard_pair in enumerate(sharded_state_dict):
         shard, current_size = shard_pair
+        # Just loop over the sharder and gather to other ranks if not master
         if not is_master:
             del shard
             continue
@@ -253,7 +268,136 @@ def save_state_dict_shards(
     return total_size
 
 
-def shard_model_checkpoint(state_dict: torch.Tensor, max_shard_size: int = 1024) -> Iterator[Tuple[OrderedDict, int]]:
+def async_save_state_dict_shards(
+    sharded_state_dict: Iterator[Tuple[OrderedDict, int]],
+    checkpoint: str,
+    index_file: "CheckpointIndexFile",
+    base_filename: str,
+    is_master: bool,
+    use_pp_format: bool = False,
+    state_preprocess: bool = False,
+) -> Tuple[int, list]:
+    """
+    Save sharded state dict only on master rank, this method can be used by both model and optimizer states.
+    Args:
+        sharded_state_dict (Iterator[Tuple[OrderedDict, int]]): a generator of shards, each shard contains state dict and shard size.
+        checkpoint (str): The path of checkpoint directory as string.
+        index_file (CheckpointIndexFile): The index file object to be updated.
+        base_filename (str): Decides the prefix of filenames of shards.
+        is_master (bool): Whether current rank is main process.
+        use_safetensors (bool, optional): Whether to use safetensors to save checkpoint. Defaults to False.
+        use_pp_format: (bool, optional): Whether to save the files in pipeline format including stage information. Defaults to False.
+
+    Returns:
+        int: the total size of shards
+    """
+    from colossalai.utils.safetensors import save
+
+    total_size = 0
+    shard_filenames = []
+    writers = []
+    for idx, shard_pair in enumerate(sharded_state_dict):
+        shard, current_size = shard_pair
+        # Just loop over the sharder and gather to other ranks if not master
+        if not is_master:
+            del shard
+            continue
+        shard_file = get_shard_filename(base_filename, idx)
+        total_size = total_size + current_size
+        for key in shard.keys():
+            index_file.append_weight_map(key, shard_file)
+        checkpoint_file_path = os.path.join(checkpoint, shard_file)
+
+        if state_preprocess:
+            state_dict, _ = _flatten_optim_state_dict(state_dict=shard, seperator=".")
+        else:
+            state_dict = shard
+
+        # Only save on master rank.
+        writer = save(checkpoint_file_path, state_dict=state_dict)
+        writers.append(writer)
+        shard_filenames.append(shard_file)
+        del shard
+
+    # Clean folder, deleted unneeded files.
+    clean_folder(checkpoint, base_filename, shard_filenames, is_master=is_master, use_pp_format=use_pp_format)
+
+    return total_size, writers
+
+
+def async_move_save_state_dict_shards(
+    sharded_state_dict: Iterator[Tuple[OrderedDict, int]],
+    checkpoint: str,
+    index_file: "CheckpointIndexFile",
+    base_filename: str,
+    is_master: bool,
+    pinned_state_dict: Optional[Dict[str, torch.Tensor]],
+    use_pp_format: bool = False,
+    state_preprocess: bool = False,
+) -> Tuple[int, Dict[str, torch.Tensor], list]:
+    """
+    Save sharded state dict only on master rank, this method can be used by both model and optimizer states.
+    Args:
+        sharded_state_dict (Iterator[Tuple[OrderedDict, int]]): a generator of shards, each shard contains state dict and shard size.
+        checkpoint (str): The path of checkpoint directory as string.
+        index_file (CheckpointIndexFile): The index file object to be updated.
+        base_filename (str): Decides the prefix of filenames of shards.
+        is_master (bool): Whether current rank is main process.
+        use_safetensors (bool, optional): Whether to use safetensors to save checkpoint. Defaults to False.
+        use_pp_format: (bool, optional): Whether to save the files in pipeline format including stage information. Defaults to False.
+
+    Returns:
+        int: the total size of shards
+    """
+    from colossalai.utils.safetensors import move_and_save
+
+    total_size = 0
+    shard_filenames = []
+    if pinned_state_dict is None:
+        returned_state_dict = {}
+    else:
+        returned_state_dict = pinned_state_dict
+    writers = []
+    for idx, shard_pair in enumerate(sharded_state_dict):
+        shard, current_size = shard_pair
+        # Just loop over the sharder and gather to other ranks if not master
+        if not is_master:
+            del shard
+            continue
+        shard_file = get_shard_filename(base_filename, idx)
+        total_size = total_size + current_size
+        for key in shard.keys():
+            index_file.append_weight_map(key, shard_file)
+        checkpoint_file_path = os.path.join(checkpoint, shard_file)
+
+        if state_preprocess:
+            state_dict, _ = _flatten_optim_state_dict(state_dict=shard)
+        else:
+            state_dict = shard
+
+        if pinned_state_dict is not None:
+            sub_pinned_state_dict = {k: pinned_state_dict[k] for k in state_dict.keys()}
+        else:
+            sub_pinned_state_dict = create_pinned_state_dict(state_dict)
+            returned_state_dict.update(sub_pinned_state_dict)
+
+        # Only save on master rank.
+        writer = move_and_save(checkpoint_file_path, state_dict, sub_pinned_state_dict)
+        writers.append(writer)
+        shard_filenames.append(shard_file)
+        del shard
+
+    # Clean folder, deleted unneeded files.
+    clean_folder(checkpoint, base_filename, shard_filenames, is_master=is_master, use_pp_format=use_pp_format)
+
+    return total_size, returned_state_dict, writers
+
+
+def shard_model_checkpoint(
+    state_dict: torch.Tensor,
+    max_shard_size: int = 1024,
+    pinned_state_dicts: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
+) -> Iterator[Tuple[OrderedDict, int]]:
     """
     Splits a model state dictionary in sub-checkpoints so that the final size of each sub-checkpoint does not exceed a
     given size.
@@ -262,6 +406,11 @@ def shard_model_checkpoint(state_dict: torch.Tensor, max_shard_size: int = 1024)
 
     for key, weight in state_dict.items():
         if not is_distributed_tensor(weight):
+            if pinned_state_dicts is not None:
+                if key not in pinned_state_dicts:
+                    pinned_state_dicts[key] = torch.empty_like(weight, pin_memory=True, device="cpu")
+                pinned_state_dicts[key].copy_(weight)
+                weight = pinned_state_dicts[key]
             block, block_size = state_dict_sharder.append_param(key, weight)
 
         if block != None:
@@ -271,7 +420,9 @@ def shard_model_checkpoint(state_dict: torch.Tensor, max_shard_size: int = 1024)
     yield state_dict_sharder.current_block, state_dict_sharder.current_block_size
 
 
-def shard_optimizer_checkpoint(state_dict: dict, max_shard_size: int = 1024) -> Iterator[Tuple[OrderedDict, int]]:
+def shard_optimizer_checkpoint(
+    state_dict: dict, max_shard_size: int = 1024, pinned_state_dicts: Optional[Dict[str, torch.Tensor]] = None
+) -> Iterator[Tuple[OrderedDict, int]]:
     """
     Splits an optimizer state dictionary in sub-checkpoints so that the final size of each sub-checkpoint does not exceed a
     given size.
@@ -282,6 +433,15 @@ def shard_optimizer_checkpoint(state_dict: dict, max_shard_size: int = 1024) -> 
     state_dict_sharder = StateDictSharder(max_shard_size)
 
     for param_id, state in states.items():
+        if pinned_state_dicts is not None:
+            if param_id not in pinned_state_dicts:
+                pinned_state_dicts[param_id] = {}
+                for k, v in state.items():
+                    if k not in pinned_state_dicts[param_id]:
+                        pinned_state_dicts[param_id][k] = torch.empty_like(v, pin_memory=True, device="cpu")
+                    pinned_state_dicts[param_id][k].copy_(v)
+                    state[k] = pinned_state_dicts[param_id][k]
+
         block, block_size = state_dict_sharder.append_optim_state(param_id, state)
         if block != None:
             yield block, block_size
@@ -294,7 +454,12 @@ def shard_optimizer_checkpoint(state_dict: dict, max_shard_size: int = 1024) -> 
 # Helper functions for saving state dict
 # ======================================
 
-def save_state_dict(state_dict: dict, checkpoint_file_path: str, use_safetensors: bool) -> None:
+
+def save_state_dict(
+    state_dict: dict,
+    checkpoint_file_path: str,
+    use_safetensors: bool,
+) -> None:
     """
     Save state dict to checkpoint.
 
@@ -304,8 +469,8 @@ def save_state_dict(state_dict: dict, checkpoint_file_path: str, use_safetensors
         use_safetensors (bool): whether to use safetensors to save the checkpoint.
     """
     # Move all tensors in the state_dict to CPU before saving to avoid serialization issues
-    state_dict_cpu = tree_map(lambda x: x.cpu() if torch.is_tensor(x) else x, state_dict)
-    
+    state_dict_cpu = tree_map(lambda x: x.data.cpu() if torch.is_tensor(x) else x, state_dict)
+
     if use_safetensors:
         assert is_safetensors_available(), "safetensors is not available."
         assert checkpoint_file_path.endswith(
@@ -360,7 +525,6 @@ def clean_folder(
                 reg = re.compile(r"(.*?)-stage-\d{5}-shard-\d{5}")
             if (
                 filename.startswith(weights_no_suffix)
-                and os.path.isfile(full_filename)
                 and filename not in shard_filenames
                 and reg.fullmatch(filename_no_suffix) is not None
             ):
@@ -504,14 +668,7 @@ def load_shard_state_dict(checkpoint_file: Path, use_safetensors: bool = False):
         raise Exception("load the model using `safetensors`, but no file endwith .safetensors")
     if use_safetensors:
         from safetensors.torch import load_file as safe_load_file
-        from safetensors.torch import safe_open
 
-        with safe_open(checkpoint_file, framework="pt") as f:
-            metadata = f.metadata()
-        if metadata["format"] != "pt":
-            raise NotImplementedError(
-                f"Conversion from a {metadata['format']} safetensors archive to PyTorch is not implemented yet."
-            )
         return safe_load_file(checkpoint_file)
     else:
         return torch.load(checkpoint_file, map_location=torch.device("cpu"))
@@ -542,10 +699,10 @@ def load_state_dict_into_model(
 
     def load(module: nn.Module, state_dict, prefix="", load_sub_module: bool = True):
         local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
-        args = (state_dict, prefix, local_metadata, True, sub_missing_keys, [], error_msgs)
+        args = (state_dict, prefix, local_metadata, True, sub_missing_keys, unexpected_keys, error_msgs)
         # Parameters of module and children will start with prefix. We can exit early if there are none in this
         # state_dict
-        if len([key for key in state_dict if key.startswith(prefix)]) > 0:
+        if strict or len([key for key in state_dict if key.startswith(prefix)]) > 0:
             module._load_from_state_dict(*args)
         if load_sub_module:
             for name, child in module._modules.items():
@@ -559,9 +716,9 @@ def load_state_dict_into_model(
 
     if strict:
         if len(unexpected_keys) > 0:
-            error_msgs = "Unexpected key(s) in state_dict: {}. ".format(
-                ", ".join('"{}"'.format(k) for k in unexpected_keys)
-            )
+            error_msgs = [
+                "Unexpected key(s) in state_dict: {}. ".format(", ".join('"{}"'.format(k) for k in unexpected_keys))
+            ]
             raise RuntimeError(
                 "Error(s) in loading state_dict for {}:\n\t{}".format(model.__class__.__name__, "\n\t".join(error_msgs))
             )
@@ -636,7 +793,7 @@ def load_states_into_optimizer(optimizer: Optimizer, state_dict: dict, id_map: d
             if key != "step":
                 if param.is_floating_point():
                     value = value.to(param.dtype)
-                value = value.to(param.device)
+                value = value.to(param.device, non_blocking=True)
             return value
         elif isinstance(value, dict):
             return {k: cast(param, v, key=k) for k, v in value.items()}
@@ -656,6 +813,7 @@ def load_states_into_optimizer(optimizer: Optimizer, state_dict: dict, id_map: d
         elif not strict:
             new_states[k] = v
 
+    get_accelerator().synchronize()
     optimizer.state.update(new_states)
 
 
@@ -765,14 +923,14 @@ def get_model_base_filenames(prefix: str = None, use_safetensors: bool = False):
     return weights_name, save_index_file
 
 
-def get_optimizer_base_filenames(prefix: str = None):
+def get_optimizer_base_filenames(prefix: str = None, use_safetensors: bool = False):
     """
     generate base optimizer state filenames
     """
-    states_name = STATES_NAME
+    states_name = SAFE_STATE_NAME if use_safetensors else STATES_NAME
     states_name = add_prefix(states_name, prefix)
 
-    save_index_file = STATES_INDEX_NAME
+    save_index_file = SAFE_STATES_INDEX_NAME if use_safetensors else STATES_INDEX_NAME
     save_index_file = add_prefix(save_index_file, prefix)
 
     param_group_file = GROUP_FILE_NAME
@@ -788,3 +946,61 @@ def get_shard_filename(weights_name: str, idx: int):
     shard_file = weights_name.replace(".bin", f"-{idx+1:05d}.bin")
     shard_file = shard_file.replace(".safetensors", f"-{idx+1:05d}.safetensors")
     return shard_file
+
+
+def _pin_tensor(tensor: torch.Tensor, empty: bool = True) -> torch.Tensor:
+    if empty:
+        return torch.empty_like(tensor, pin_memory=True, device="cpu")
+    return tensor.pin_memory()
+
+
+def create_pinned_state_dict(
+    state_dict: Union[Dict[str, torch.Tensor], Dict[int, Dict[str, torch.Tensor]]],
+    empty: bool = True,
+    num_threads: int = 1,
+) -> Dict[str, torch.Tensor]:
+    if num_threads == 1:
+        return tree_map(lambda x: _pin_tensor(x, empty=empty) if isinstance(x, torch.Tensor) else x, state_dict)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            elems, spec = tree_flatten(state_dict)
+            future_to_idx = {}
+            for i, elem in enumerate(elems):
+                if isinstance(elem, torch.Tensor):
+                    future_to_idx[executor.submit(_pin_tensor, elem, empty)] = i
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                elems[idx] = future.result()
+            return tree_unflatten(elems, spec)
+
+
+def load_optim_or_model_shard(path: str, is_optim: bool, use_safetensors: bool) -> dict:
+    if is_optim:
+        if path.endswith(".safetensors"):
+            state_dict = load_flat(path)
+        else:
+            state_dict = load_shard_state_dict(Path(path), use_safetensors=False)
+    else:
+        state_dict = load_shard_state_dict(Path(path), use_safetensors)
+    return state_dict
+
+
+def load_state_dict_shards(
+    checkpoint_files: List[str],
+    is_optim: bool,
+    use_safetensors: bool,
+    low_cpu_mem_mode: bool = True,
+    prefetch: int = 3,
+) -> Generator[dict, None, None]:
+    if low_cpu_mem_mode:
+        for shard_file in checkpoint_files:
+            state_dict = load_optim_or_model_shard(shard_file, is_optim, use_safetensors)
+            yield state_dict
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=prefetch) as executor:
+            futures = []
+            for shard_file in checkpoint_files:
+                future = executor.submit(load_optim_or_model_shard, shard_file, is_optim, use_safetensors)
+                futures.append(future)
+            for future in concurrent.futures.as_completed(futures):
+                yield future.result()

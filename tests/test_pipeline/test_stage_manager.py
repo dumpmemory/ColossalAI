@@ -52,7 +52,7 @@ def check_stage_manager():
     # check p2p groups
     for prev, cur in zip(ranks_in_group[:-1], ranks_in_group[1:]):
         if rank in [prev, cur]:
-            group = stage_manager.get_p2p_process_group(prev, cur)
+            group = stage_manager.get_p2p_process_group()
             dist.barrier(group=group)
 
     # check stage groups
@@ -64,7 +64,7 @@ def check_stage_manager():
 
 
 def run_dist(rank, world_size, port):
-    colossalai.launch(config={}, rank=rank, world_size=world_size, port=port, host="localhost")
+    colossalai.launch(rank=rank, world_size=world_size, port=port, host="localhost")
     check_stage_manager()
 
 

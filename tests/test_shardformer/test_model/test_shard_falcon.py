@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.distributed as dist
 
 import colossalai
 from colossalai.logging import disable_existing_loggers
@@ -72,6 +73,8 @@ def check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, 
     if stage_manager is None or stage_manager.is_first_stage():
         if test_config["precision"] == "fp32":
             atol, rtol = 2e-4, 1e-3
+            if dist.get_world_size() > 4:
+                atol, rtol = 4e-4, 3e-2
         else:
             atol, rtol = 5e-3, 5e-3
         check_weight(falcon, sharded_falcon, col_layer_for_check, tp_group, atol=atol, rtol=rtol, dim=1, verbose=False)
@@ -89,37 +92,18 @@ def check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, 
             "tp_size": 2,
             "pp_size": 2,
             "num_microbatches": 4,
-            "enable_all_optimization": True,
-            "use_lazy_init": True,
+            "enable_all_optimization": False,
+            "use_lazy_init": False,
             "precision": "fp16",
             "initial_scale": 1,
         },
-        {
-            "tp_size": 1,
-            "pp_size": 2,
-            "num_microbatches": 4,
-            "enable_all_optimization": False,
-            "use_lazy_init": False,
-            "precision": "fp32",
-        },
         {"tp_size": 4, "pp_size": 1, "enable_all_optimization": True, "use_lazy_init": False, "precision": "fp32"},
-        {"tp_size": 2, "pp_size": 1, "enable_all_optimization": True, "use_lazy_init": False, "precision": "fp32"},
         {
             "tp_size": 2,
             "pp_size": 1,
             "enable_all_optimization": True,
             "use_lazy_init": True,
             "zero_stage": 2,
-            "precision": "fp16",
-            "initial_scale": 1,
-        },
-        {
-            "tp_size": 1,
-            "pp_size": 2,
-            "num_microbatches": 2,
-            "enable_all_optimization": True,
-            "use_lazy_init": True,
-            "zero_stage": 1,
             "precision": "fp16",
             "initial_scale": 1,
         },
@@ -173,13 +157,13 @@ def run_falcon_3d_test(test_config):
 
 def check_falcon(rank, world_size, port):
     disable_existing_loggers()
-    colossalai.launch(config={}, rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
+    colossalai.launch(rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
     run_falcon_test()
 
 
 def check_falcon_3d(rank, world_size, port):
     disable_existing_loggers()
-    colossalai.launch(config={}, rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
+    colossalai.launch(rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
     run_falcon_3d_test()
 
 

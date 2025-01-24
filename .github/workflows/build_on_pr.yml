@@ -2,7 +2,7 @@ name: Build on PR
 
 on:
   pull_request:
-    types: [synchronize, opened, reopened, ready_for_review, closed, edited]
+    types: [synchronize, opened, reopened, ready_for_review, closed]
     branches:
       - "main"
       - "develop"
@@ -89,9 +89,9 @@ jobs:
     if: needs.detect.outputs.anyLibraryFileChanged == 'true'
     runs-on: [self-hosted, gpu]
     container:
-      image: hpcaitech/pytorch-cuda:2.1.0-12.1.0
-      options: --gpus all --rm -v /dev/shm -v /data/scratch/llama-tiny:/data/scratch/llama-tiny
-    timeout-minutes: 60
+      image: hpcaitech/pytorch-cuda:2.2.2-12.1.0
+      options: --gpus all --rm -v /dev/shm -v /data/scratch:/data/scratch
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -117,7 +117,7 @@ jobs:
           cd TensorNVMe
           conda install cmake
           pip install -r requirements.txt
-          pip install -v .
+          DISABLE_URING=1 pip install -v --no-cache-dir .
 
       - name: Store TensorNVMe Cache
         run: |
@@ -140,8 +140,8 @@ jobs:
 
       - name: Install Colossal-AI
         run: |
-          CUDA_EXT=1 pip install -v -e .
-          pip install -r requirements/requirements-test.txt
+          BUILD_EXT=1 pip install -v -e .
+          pip install --no-cache-dir -r requirements/requirements-test.txt
 
       - name: Store Colossal-AI Cache
         run: |
@@ -160,13 +160,12 @@ jobs:
           --ignore tests/test_gptq \
           --ignore tests/test_infer_ops \
           --ignore tests/test_legacy \
-          --ignore tests/test_moe \
           --ignore tests/test_smoothquant \
-          --ignore tests/test_checkpoint_io \
           tests/
         env:
           LD_LIBRARY_PATH: /github/home/.tensornvme/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
           LLAMA_PATH: /data/scratch/llama-tiny
+          MOE_TENSOR_PATH: /data/scratch/moe_tensors
 
       - name: Collate artifact
         env:

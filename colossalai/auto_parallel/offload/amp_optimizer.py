@@ -4,10 +4,10 @@ from typing import Dict, Tuple
 import torch
 from torch.optim import Optimizer
 
+from colossalai.accelerator import get_accelerator
 from colossalai.amp.naive_amp.grad_scaler import DynamicGradScaler
 from colossalai.interface import OptimizerWrapper
 from colossalai.logging import get_dist_logger
-from colossalai.utils import get_current_device
 
 from .base_offload_module import BaseOffloadModule
 from .region import Region
@@ -79,7 +79,9 @@ class AMPOptimizer(OptimizerWrapper):
             hysteresis=hysteresis,
             max_scale=max_scale,
         )
-        self._found_overflow: torch.Tensor = torch.zeros(1, dtype=torch.int64, device=get_current_device())
+        self._found_overflow: torch.Tensor = torch.zeros(
+            1, dtype=torch.int64, device=get_accelerator().get_current_device()
+        )
         self._logger = get_dist_logger()
 
     def _set_grad_ptr(self):
@@ -124,7 +126,7 @@ class AMPOptimizer(OptimizerWrapper):
         return self.grad_scaler.scale.item()
 
     def zero_grad(self, *args, **kwargs):
-        self.module.overflow_counter = torch.cuda.IntTensor([0])
+        self.module.overflow_counter = torch.tensor([0], dtype=torch.int, device=get_accelerator().get_current_device())
         return self.optim.zero_grad(set_to_none=True)
 
     def step(self, *args, **kwargs):

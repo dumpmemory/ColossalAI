@@ -4,15 +4,15 @@ import torch.distributed as dist
 from torch.distributed.distributed_c10d import _get_default_group
 
 import colossalai
+from colossalai.accelerator import get_accelerator
 from colossalai.tensor import ColoParameter
 from colossalai.testing import parameterize, rerun_if_address_is_in_use, spawn
-from colossalai.utils import get_current_device
 from colossalai.zero.gemini import TensorState
 from colossalai.zero.gemini.chunk import Chunk
 
 
 def dist_sum(x):
-    temp = torch.tensor([x], device=get_current_device())
+    temp = torch.tensor([x], device=get_accelerator().get_current_device())
     dist.all_reduce(temp)
     return temp.item()
 
@@ -34,7 +34,8 @@ def check_equal(param, param_cp):
 @parameterize("init_device", [None, torch.device("cpu")])
 @parameterize("keep_gathered", [True, False])
 @parameterize("pin_memory", [True, False])
-def exam_chunk_basic(init_device, keep_gathered, pin_memory):
+@parameterize("async_op", [True, False])
+def exam_chunk_basic(init_device, keep_gathered, pin_memory, async_op):
     world_size = torch.distributed.get_world_size()
     pg = _get_default_group()
     my_chunk = Chunk(
@@ -66,7 +67,7 @@ def exam_chunk_basic(init_device, keep_gathered, pin_memory):
         assert my_chunk.cpu_shard.size(0) == 1024 // world_size
         assert my_chunk.device_type == "cpu"
         assert my_chunk.can_move
-        my_chunk.shard_move(get_current_device())
+        my_chunk.shard_move(get_accelerator().get_current_device())
     else:
         assert my_chunk.cuda_global_chunk.size(0) == 1024
         assert my_chunk.device_type == "cuda"
@@ -94,8 +95,11 @@ def exam_chunk_basic(init_device, keep_gathered, pin_memory):
 
     assert my_chunk.tensor_state_cnter[TensorState.READY_FOR_REDUCE] == 4
     assert my_chunk.can_reduce
-    my_chunk.reduce()
+    my_chunk.reduce(async_op)
     assert my_chunk.tensor_state_cnter[TensorState.HOLD] == 4
+
+    if async_op:
+        my_chunk.wait_async_reduce()
 
     if keep_gathered is False:
         assert my_chunk.cuda_shard.size(0) == 1024 // world_size
@@ -108,7 +112,7 @@ def exam_chunk_basic(init_device, keep_gathered, pin_memory):
 
 
 def run_dist(rank, world_size, port):
-    colossalai.launch(config={}, rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
+    colossalai.launch(rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
     exam_chunk_basic()
 
 

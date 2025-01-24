@@ -9,21 +9,22 @@ Author: [Mingyan Jiang](https://github.com/jiangmingyan)
 **Related Paper**
 
 - [Accelerating Scientific Computations with Mixed Precision Algorithms](https://arxiv.org/abs/0808.2794)
+- [FP8 Formats for Deep Learning](https://arxiv.org/pdf/2209.05433)
 
 ## Introduction
 
 AMP stands for automatic mixed precision training.
 In Colossal-AI, we have incorporated different implementations of mixed precision training:
 
-1. torch.cuda.amp
+1. torch.amp
 2. apex.amp
 3. naive amp
 
 | Colossal-AI    | support tensor parallel | support pipeline parallel | fp16 extent                                                                                          |
-| -------------- | ----------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------- |
-| AMP_TYPE.TORCH | ✅                      | ❌                        | Model parameters, activation, gradients are downcast to fp16 during forward and backward propagation |
-| AMP_TYPE.APEX  | ❌                      | ❌                        | More fine-grained, we can choose opt_level O0, O1, O2, O3                                            |
-| AMP_TYPE.NAIVE | ✅                      | ✅                        | Model parameters, forward and backward operations are all downcast to fp16                           |
+|----------------|-------------------------|---------------------------|------------------------------------------------------------------------------------------------------|
+| AMP_TYPE.TORCH | ✅                       | ❌                         | Model parameters, activation, gradients are downcast to fp16 during forward and backward propagation |
+| AMP_TYPE.APEX  | ❌                       | ❌                         | More fine-grained, we can choose opt_level O0, O1, O2, O3                                            |
+| AMP_TYPE.NAIVE | ✅                       | ✅                         | Model parameters, forward and backward operations are all downcast to fp16                           |
 
 The first two rely on the original implementation of PyTorch (version 1.6 and above) and NVIDIA Apex.
 The last method is similar to Apex O2 level.
@@ -60,7 +61,11 @@ However, there are other operations, like reductions, which require the dynamic 
 
 ## AMP in Colossal-AI
 
-We supported three AMP training methods and allowed the user to train with AMP with no code. If you want to train with amp, just assign `mixed_precision` with `fp16` when you instantiate the `Booster`. Next we will support `bf16`, `fp8`.
+We supported three AMP training methods and allowed the user to train with AMP with no code. If you want to train with amp, just assign `mixed_precision` with `fp16` when you instantiate the `Booster`. Next we will support `bf16`.
+
+Currently we only support `fp8` mixed precision training for the `Linear` layer. Please specify the `use_fp8` parameter when create the plugin object.
+
+To reduce the communication volume inter nodes in low-bandwidth scenarios, we support FP8 communication compression. Please specify the `fp8_communication` parameter when create the  plugin object.
 
 ### Start with Booster
 
@@ -74,7 +79,6 @@ instantiate `Booster` with `mixed_precision="fp16"`, then you can train with tor
     'fp16': torch amp
     'fp16_apex': apex amp,
     'bf16': bf16,
-    'fp8': fp8,
     'fp16_naive': naive amp
 """
 from colossalai import Booster
@@ -128,6 +132,10 @@ The output model is converted to AMP model of smaller memory consumption.
 If your input model is already too large to fit in a GPU, please instantiate your model weights in `dtype=torch.float16`.
 Otherwise, try smaller models or checkout more parallelization training techniques!
 
+### FP8 Communication
+
+In low-bandwidth scenarios, to reduce the communication load multiple nodes, we support FP8 communication compression, which can be enabled by using `fp8_communication=True` when you when create the plugin object (such as `GeminiPlugin`). The all-to-all, all-gather and P2P operations inter nodes will use FP8 format for data transmission. Currently the FP8 communication of reduction operators such as all-reduce and reduce-scatter is currently not supported due to lack of support of the NCCL library.
+
 ## Hands-on Practice
 
 Now we will introduce the use of AMP with Colossal-AI. In this practice, we will use Torch AMP as an example.
@@ -164,7 +172,7 @@ parser = colossalai.get_default_parser()
 args = parser.parse_args()
 
 # launch from torch
-colossalai.launch_from_torch(config=dict())
+colossalai.launch_from_torch()
 
 ```
 

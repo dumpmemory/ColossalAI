@@ -1,4 +1,5 @@
 import argparse
+from contextlib import nullcontext
 from typing import Callable, List, Union
 
 import evaluate
@@ -13,11 +14,12 @@ from tqdm import tqdm
 from transformers import AutoConfig, GPT2ForSequenceClassification, get_linear_schedule_with_warmup
 
 import colossalai
+from colossalai.accelerator import get_accelerator
 from colossalai.booster import Booster
 from colossalai.booster.plugin import GeminiPlugin, HybridParallelPlugin, LowLevelZeroPlugin, TorchDDPPlugin
 from colossalai.cluster import DistCoordinator
+from colossalai.lazy import LazyInitContext
 from colossalai.nn.optimizer import HybridAdam
-from colossalai.utils import get_current_device
 
 # ==============================
 # Prepare Hyperparameters
@@ -54,7 +56,7 @@ def evaluate_model(
         use_pipeline = isinstance(booster.plugin, HybridParallelPlugin) and booster.plugin.pp_size > 1
         is_pp_last_stage = use_pipeline and booster.plugin.stage_manager.is_last_stage()
 
-        accum_loss = torch.zeros(1, device=get_current_device())
+        accum_loss = torch.zeros(1, device=get_accelerator().get_current_device())
         for batch in dataloader:
             batch = move_to_cuda(batch)
             labels = batch["labels"]
@@ -83,8 +85,10 @@ def evaluate_model(
                     object_list = [None, None]
                     dist.broadcast_object_list(object_list, src=current_pp_group_ranks[-1], group=pp_group)
 
-                    metric.add_batch(predictions=object_list[0].to(get_current_device()), references=labels)
-                    accum_loss.add_(object_list[1].to(get_current_device()))
+                    metric.add_batch(
+                        predictions=object_list[0].to(get_accelerator().get_current_device()), references=labels
+                    )
+                    accum_loss.add_(object_list[1].to(get_accelerator().get_current_device()))
 
             else:
                 batch = move_to_cuda(batch)
@@ -143,7 +147,7 @@ def train_epoch(
         for _ in pbar:
             if use_pipeline:
                 outputs = booster.execute_pipeline(
-                    train_dataloader_iter, model, _criterion, optimizer, return_loss=True, return_outputs=True
+                    train_dataloader_iter, model, _criterion, optimizer, return_loss=True
                 )
                 # Backward and optimize
                 if is_pp_last_stage:
@@ -185,6 +189,7 @@ def main():
     )
     parser.add_argument("--target_f1", type=float, default=None, help="target f1 score. Raise exception if not reached")
     parser.add_argument("--use_lazy_init", type=bool, default=False, help="for initiating lazy init context")
+    parser.add_argument("--use_fp8_comm", type=bool, default=False, help="for using fp8 during communication")
     args = parser.parse_args()
 
     if args.model_type == "gpt2":
@@ -194,7 +199,7 @@ def main():
     # ==============================
     # Launch Distributed Environment
     # ==============================
-    colossalai.launch_from_torch(config={}, seed=42)
+    colossalai.launch_from_torch(seed=42)
     coordinator = DistCoordinator()
 
     # local_batch_size = BATCH_SIZE // coordinator.world_size
@@ -207,7 +212,7 @@ def main():
     if args.plugin == "torch_ddp_fp16":
         booster_kwargs["mixed_precision"] = "fp16"
     if args.plugin.startswith("torch_ddp"):
-        plugin = TorchDDPPlugin()
+        plugin = TorchDDPPlugin(fp8_communication=args.use_fp8_comm)
     elif args.plugin == "gemini":
         plugin = GeminiPlugin(initial_scale=2**5)
     elif args.plugin == "low_level_zero":
@@ -223,6 +228,7 @@ def main():
             zero_stage=1,
             precision="fp16",
             initial_scale=1,
+            fp8_communication=args.use_fp8_comm,
         )
 
     booster = Booster(plugin=plugin, **booster_kwargs)
@@ -241,12 +247,23 @@ def main():
     # ====================================
     # gpt2 pretrained model
 
-    cfg = AutoConfig.from_pretrained(model_name, num_labels=data_builder.num_labels)
+    cfg = AutoConfig.from_pretrained(
+        model_name,
+        num_labels=data_builder.num_labels,
+        pad_token=data_builder.tokenizer.pad_token,
+        pad_token_id=data_builder.tokenizer.pad_token_id,
+    )
 
-    if model_name == "gpt2":
-        model = GPT2ForSequenceClassification.from_pretrained(model_name, config=cfg).cuda()
-    else:
-        raise RuntimeError
+    init_ctx = (
+        LazyInitContext(default_device=get_accelerator().get_current_device())
+        if isinstance(plugin, (GeminiPlugin))
+        else nullcontext()
+    )
+    with init_ctx:
+        if model_name == "gpt2":
+            model = GPT2ForSequenceClassification.from_pretrained(model_name, config=cfg).cuda()
+        else:
+            raise RuntimeError
 
     # optimizer
     no_decay = ["bias", "LayerNorm.weight"]

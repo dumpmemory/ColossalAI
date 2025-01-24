@@ -57,7 +57,11 @@ ceval_subject_mapping = {
     "urban_and_rural_planner": ["Urban and Rural Planner", "注册城乡规划师", "Other"],
     "accountant": ["Accountant", "注册会计师", "Other"],
     "fire_engineer": ["Fire Engineer", "注册消防工程师", "Other"],
-    "environmental_impact_assessment_engineer": ["Environmental Impact Assessment Engineer", "环境影响评价工程师", "Other"],
+    "environmental_impact_assessment_engineer": [
+        "Environmental Impact Assessment Engineer",
+        "环境影响评价工程师",
+        "Other",
+    ],
     "tax_accountant": ["Tax Accountant", "税务师", "Other"],
     "physician": ["Physician", "医师资格", "Other"],
 }
@@ -66,7 +70,7 @@ default_inference_kwargs = {
     "calculate_loss": False,
     "all_classes": ["A", "B", "C", "D"],
     "language": "Chinese",
-    "pretrain": False,
+    "calculate_overall_loss": False,
     "max_new_tokens": 32,
 }
 
@@ -86,9 +90,7 @@ class CEvalDataset(BaseDataset):
     """
 
     @staticmethod
-    def load(
-        path: str, logger: DistributedLogger, few_shot: bool, forward_only: bool, load_train: bool, load_reference: bool
-    ) -> List[Dict]:
+    def load(path: str, logger: DistributedLogger, few_shot: bool, *args, **kwargs) -> List[Dict]:
         dataset = {"dev": {}, "test": {}}
         for split in ["dev", "test"]:
             files = os.listdir(os.path.join(path, split))

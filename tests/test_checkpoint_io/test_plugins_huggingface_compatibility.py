@@ -18,7 +18,7 @@ from tests.kit.model_zoo import model_zoo
 
 
 @clear_cache_before_run()
-@parameterize("model_name", ["transformers_llama_for_casual_lm"])
+@parameterize("model_name", ["transformers_llama_for_causal_lm"])
 @parameterize("plugin_type", ["ddp", "zero", "gemini"])
 def exam_from_pretrained(plugin_type: str, model_name: str, shard=True, size_per_shard=32):
     (model_fn, data_gen_fn, output_transform_fn, loss_fn, _) = next(
@@ -61,15 +61,14 @@ def exam_from_pretrained(plugin_type: str, model_name: str, shard=True, size_per
         new_model, new_optimizer, criterion, _, _ = booster.boost(new_model, new_optimizer, criterion)
 
         if plugin_type == "gemini":
-            check_state_dict_equal(model.state_dict(only_rank_0=False), new_model.state_dict(only_rank_0=False), False)
+            check_state_dict_equal(model.state_dict(only_rank_0=False), new_model.state_dict(only_rank_0=False))
         else:
-            check_state_dict_equal(model.unwrap().state_dict(), new_model.unwrap().state_dict(), False)
+            check_state_dict_equal(model.unwrap().state_dict(), new_model.unwrap().state_dict())
         dist.barrier()
 
 
 def run_dist(rank, world_size, port):
-    config = {}
-    colossalai.launch(config=config, rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
+    colossalai.launch(rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
     exam_from_pretrained()
 
 

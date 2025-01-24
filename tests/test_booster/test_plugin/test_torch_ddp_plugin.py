@@ -10,10 +10,11 @@ import colossalai
 from colossalai.booster import Booster
 from colossalai.booster.plugin import TorchDDPPlugin
 from colossalai.interface import OptimizerWrapper
-from colossalai.testing import rerun_if_address_is_in_use, spawn
-from tests.kit.model_zoo import model_zoo, IS_FAST_TEST, COMMON_MODELS
+from colossalai.testing import clear_cache_before_run, rerun_if_address_is_in_use, spawn
+from tests.kit.model_zoo import COMMON_MODELS, IS_FAST_TEST, model_zoo
 
 
+@clear_cache_before_run()
 def run_fn(model_fn, data_gen_fn, output_transform_fn):
     plugin = TorchDDPPlugin()
     booster = Booster(plugin=plugin)
@@ -46,7 +47,7 @@ def check_torch_ddp_plugin():
         registry = model_zoo
 
     for name, (model_fn, data_gen_fn, output_transform_fn, _, _) in registry.items():
-        if name == "dlrm_interactionarch":
+        if name in ("dlrm_interactionarch", "transformers_mixtral") or name.startswith("simple_"):
             continue
         run_fn(model_fn, data_gen_fn, output_transform_fn)
         torch.cuda.empty_cache()
@@ -108,7 +109,7 @@ def check_torch_ddp_no_sync():
 
 def run_dist(rank, world_size, port):
     # init dist env
-    colossalai.launch(config=dict(), rank=rank, world_size=world_size, port=port, host="localhost")
+    colossalai.launch(rank=rank, world_size=world_size, port=port, host="localhost")
     check_torch_ddp_plugin()
     check_torch_ddp_no_sync()
 

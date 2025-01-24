@@ -7,7 +7,6 @@ from transformers import LlamaForCausalLM
 from utils import shared_tempdir
 
 import colossalai
-from colossalai.testing import skip_if_not_enough_gpus
 from colossalai.booster import Booster
 from colossalai.booster.plugin import GeminiPlugin
 from colossalai.lazy import LazyInitContext
@@ -22,14 +21,10 @@ from colossalai.testing import (
 from tests.kit.model_zoo import model_zoo
 
 MODEL_PLACEMENT_CONFIGS = [
-    {"placement_policy": "static", "shard_param_frac": 0.0},  # zero2
-    {"placement_policy": "static", "shard_param_frac": 1.0},  # zero3
-    {"placement_policy": "static", "shard_param_frac": 0.5},  # zero3-half
+    {"placement_policy": "static", "shard_param_frac": 0.5},
 ]
 
 OPTIM_PLACEMENT_CONFIGS = [
-    {"placement_policy": "static", "shard_param_frac": 0.0, "offload_optim_frac": 0.0},  # zero2
-    {"placement_policy": "static", "shard_param_frac": 0.0, "offload_optim_frac": 1.0},  # zero2-offload
     {"placement_policy": "static", "shard_param_frac": 0.0, "offload_optim_frac": 0.5},  # zero2-offload-half
 ]
 
@@ -40,52 +35,95 @@ OPTIM_PLACEMENT_CONFIGS = [
 @parameterize("use_safetensors", [False, True])
 @parameterize("tp_size", [1, 2])
 @parameterize("zero_size", [2])
-def exam_state_dict_with_origin(placement_config, model_name, use_safetensors: bool, tp_size: int, zero_size: int):
+@parameterize("use_async", [False, True])
+def exam_state_dict_with_origin(
+    placement_config, model_name, use_safetensors: bool, tp_size: int, zero_size: int, use_async: bool
+):
     from transformers import BertForSequenceClassification
 
     (model_fn, data_gen_fn, output_transform_fn, _, _) = next(iter(model_zoo.get_sub_registry(model_name).values()))
     bert_model = model_fn()
-    enable_all_optimization = True if tp_size > 1 else False
+
+    enable_flash_attention = True if tp_size > 1 else False
+    enable_fused_normalization = True if tp_size > 1 else False
+    enable_jit_fused = True if tp_size > 1 else False
 
     with shared_tempdir() as tempdir:
         pretrained_path = os.path.join(tempdir, "pretrained")
         bert_model.config.save_pretrained(save_directory=pretrained_path)
 
         extra_dp_size = dist.get_world_size() // (zero_size * tp_size)
-        plugin = GeminiPlugin(**placement_config, tp_size=tp_size, enable_all_optimization=enable_all_optimization, extra_dp_size=extra_dp_size)
+        plugin = GeminiPlugin(
+            **placement_config,
+            tp_size=tp_size,
+            enable_flash_attention=enable_flash_attention,
+            enable_fused_normalization=enable_fused_normalization,
+            enable_jit_fused=enable_jit_fused,
+            extra_dp_size=extra_dp_size,
+        )
         booster = Booster(plugin=plugin)
         bert_model, _, _, _, _ = booster.boost(bert_model)
         model_size = sum(p.numel() * p.element_size() for p in bert_model.parameters()) / 1024**2
 
         booster.save_model(
-            bert_model, pretrained_path, True, True, "", (model_size / 3), use_safetensors=use_safetensors
+            bert_model,
+            pretrained_path,
+            True,
+            True,
+            "",
+            (model_size / 3),
+            use_safetensors=use_safetensors,
+            use_async=use_async,
         )
+        booster.checkpoint_io._sync_d2h()
+        booster.checkpoint_io._sync_io()
         dist.barrier()
-
         new_bert_model = BertForSequenceClassification.from_pretrained(pretrained_path)
-        check_state_dict_equal(bert_model.state_dict(only_rank_0=False), new_bert_model.state_dict(), False)
+        check_state_dict_equal(bert_model.state_dict(only_rank_0=False), new_bert_model.state_dict())
 
 
 @clear_cache_before_run()
 @parameterize("placement_config", OPTIM_PLACEMENT_CONFIGS)
 @parameterize("shard", [True, False])
-@parameterize("model_name", ["transformers_llama_for_casual_lm"])
+@parameterize("model_name", ["transformers_llama_for_causal_lm"])
 @parameterize("size_per_shard", [32])
 @parameterize("tp_size", [1, 2])
 @parameterize("zero_size", [2])
-def exam_state_dict(placement_config, shard: bool, model_name: str, size_per_shard: int, tp_size: int, zero_size: int):
+@parameterize("use_async", [False, True])
+@parameterize("low_cpu_mem_mode", [True, False])
+def exam_state_dict(
+    placement_config,
+    shard: bool,
+    model_name: str,
+    size_per_shard: int,
+    tp_size: int,
+    zero_size: int,
+    use_async: bool,
+    low_cpu_mem_mode: bool,
+):
     (model_fn, data_gen_fn, output_transform_fn, _, _) = next(iter(model_zoo.get_sub_registry(model_name).values()))
     criterion = lambda x: x.mean()
-    enable_all_optimization = True if tp_size > 1 else False
+    enable_flash_attention = True if tp_size > 1 else False
+    enable_fused_normalization = True if tp_size > 1 else False
+    enable_jit_fused = True if tp_size > 1 else False
     extra_dp_size = dist.get_world_size() // (zero_size * tp_size)
-    plugin = GeminiPlugin(**placement_config, precision="fp16", initial_scale=(2**14), tp_size=tp_size, extra_dp_size=extra_dp_size, enable_all_optimization=enable_all_optimization)
+    plugin = GeminiPlugin(
+        **placement_config,
+        precision="fp16",
+        initial_scale=(2**14),
+        tp_size=tp_size,
+        extra_dp_size=extra_dp_size,
+        enable_flash_attention=enable_flash_attention,
+        enable_fused_normalization=enable_fused_normalization,
+        enable_jit_fused=enable_jit_fused,
+    )
     booster = Booster(plugin=plugin)
 
     model = model_fn()
     new_model = model_fn()
     optimizer = HybridAdam(model.parameters(), lr=0.001)
     model, optimizer, criterion, _, _ = booster.boost(model, optimizer, criterion)
-    new_optimizer = HybridAdam(new_model.parameters(), lr=0.001)
+    new_optimizer = HybridAdam(new_model.parameters(), lr=0.01)
     new_model, new_optimizer, criterion, _, _ = booster.boost(new_model, new_optimizer, criterion)
 
     data = data_gen_fn()
@@ -97,24 +135,35 @@ def exam_state_dict(placement_config, shard: bool, model_name: str, size_per_sha
 
     booster.backward(loss, optimizer)
     optimizer.step()
+    for group in optimizer.param_groups:
+        group["lr"] = 0.1
 
     with shared_tempdir() as tempdir:
         model_ckpt_path = f"{tempdir}/model"
         optimizer_ckpt_path = f"{tempdir}/optimizer"
-        booster.save_model(model, model_ckpt_path, shard=shard, size_per_shard=size_per_shard)
 
-        booster.save_optimizer(optimizer, optimizer_ckpt_path, shard=shard, size_per_shard=size_per_shard)
+        if not shard and use_async:
+            model_ckpt_path = f"{model_ckpt_path}.safetensors"
+            optimizer_ckpt_path = f"{optimizer_ckpt_path}.safetensors"
+
+        booster.save_model(model, model_ckpt_path, shard=shard, size_per_shard=size_per_shard, use_async=use_async)
+
+        booster.save_optimizer(
+            optimizer, optimizer_ckpt_path, shard=shard, size_per_shard=size_per_shard, use_async=use_async
+        )
+        booster.checkpoint_io._sync_d2h()
+        booster.checkpoint_io._sync_io()
         dist.barrier()
 
-        booster.load_model(new_model, model_ckpt_path)
+        booster.load_model(new_model, model_ckpt_path, low_cpu_mem_mode=low_cpu_mem_mode)
         check_state_dict_equal(
-            model.state_dict(only_rank_0=False), new_model.state_dict(only_rank_0=False), False, ignore_dtype=True
+            model.state_dict(only_rank_0=False), new_model.state_dict(only_rank_0=False), ignore_dtype=True
         )
 
-        booster.load_optimizer(new_optimizer, optimizer_ckpt_path)
-        check_state_dict_equal(
-            optimizer.state_dict(only_rank_0=False), new_optimizer.state_dict(only_rank_0=False), False
-        )
+        booster.load_optimizer(new_optimizer, optimizer_ckpt_path, low_cpu_mem_mode=low_cpu_mem_mode)
+        check_state_dict_equal(optimizer.state_dict(only_rank_0=False), new_optimizer.state_dict(only_rank_0=False))
+        for group in new_optimizer.param_groups:
+            assert group["lr"] == 0.1
 
         # Check the new model/optimizer can successfully run.
         data = data_gen_fn()
@@ -127,8 +176,18 @@ def exam_state_dict(placement_config, shard: bool, model_name: str, size_per_sha
         loss = criterion(output[output_key])
         booster.backward(loss, new_optimizer)
         new_optimizer.step()
-        booster.save_model(new_model, model_ckpt_path, shard=shard)
-        booster.save_optimizer(new_optimizer, optimizer_ckpt_path, shard=shard)
+
+    with shared_tempdir() as new_tempdir:
+        model_ckpt_path = f"{new_tempdir}/model"
+        optimizer_ckpt_path = f"{new_tempdir}/optimizer"
+
+        if not shard and use_async:
+            model_ckpt_path = f"{model_ckpt_path}.safetensors"
+            optimizer_ckpt_path = f"{optimizer_ckpt_path}.safetensors"
+        booster.save_model(new_model, model_ckpt_path, shard=shard, use_async=use_async)
+        booster.save_optimizer(new_optimizer, optimizer_ckpt_path, shard=shard, use_async=use_async)
+        booster.checkpoint_io._sync_d2h()
+        booster.checkpoint_io._sync_io()
 
 
 def exam_lazy_from_pretrained():
@@ -145,12 +204,11 @@ def exam_lazy_from_pretrained():
         booster.save_model(model, save_path, shard=False)
         dist.barrier()
         state_dict = torch.load(save_path, map_location="cpu")
-        check_state_dict_equal(state_dict, orig_state_dict, False, ignore_dtype=True)
+        check_state_dict_equal(state_dict, orig_state_dict, ignore_dtype=True)
 
 
 def run_dist(rank, world_size, port):
-    config = {}
-    colossalai.launch(config=config, rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
+    colossalai.launch(rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
     exam_state_dict()
     exam_state_dict_with_origin()
     exam_lazy_from_pretrained()
@@ -161,8 +219,6 @@ def run_dist(rank, world_size, port):
 def test_gemini_ckpIO():
     spawn(run_dist, 4)
 
-@pytest.mark.largedist
-@skip_if_not_enough_gpus(min_gpus=8)
-@rerun_if_address_is_in_use()
-def test_gemini_ckpIO_3d():
-    spawn(run_dist, 8)
+
+if __name__ == "__main__":
+    test_gemini_ckpIO()

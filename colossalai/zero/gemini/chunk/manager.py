@@ -5,7 +5,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from colossalai.utils import free_storage, get_current_device
+from colossalai.accelerator import get_accelerator
+from colossalai.utils import free_storage
 
 from .chunk import Chunk, ChunkFullError, TensorState
 
@@ -19,8 +20,15 @@ class ChunkManager:
         init_device (torch.device): optional, the device on which the chunk is initialized. The default is None.
     """
 
-    def __init__(self, chunk_configuration, init_device: Optional[torch.device] = None) -> None:
-        self.device = init_device or get_current_device()
+    def __init__(
+        self,
+        chunk_configuration,
+        init_device: Optional[torch.device] = None,
+        reuse_fp16_chunk: bool = True,
+        max_prefetch: int = 0,
+        fp8_communication: bool = False,
+    ) -> None:
+        self.device = init_device or get_accelerator().get_current_device()
         self.dp_degree_chunk_size_dict: Dict[int, int] = dict()
         self.kwargs_config = chunk_configuration
         for k, v in self.kwargs_config.items():
@@ -32,6 +40,12 @@ class ChunkManager:
         self.accessed_chunks: Set[Chunk] = set()
         self.accessed_mem: int = 0
         self.total_mem: Dict[str, int] = {"cpu": 0, "cuda": 0}
+        self.reuse_fp16_chunk = reuse_fp16_chunk
+        # Whether model is accumulating gradients,
+        self.accumulating_grads = False
+        self.overflow_counter = torch.tensor([0], dtype=torch.int, device=get_accelerator().get_current_device())
+        self._prefetch_stream = get_accelerator().Stream() if max_prefetch else None
+        self.fp8_communication = fp8_communication
 
     def register_tensor(
         self,
@@ -89,6 +103,8 @@ class ChunkManager:
                 extra_dp_group=extra_dp_group,
                 **chunk_kwargs,
             )
+            if self.fp8_communication:
+                chunk.fp8_communication = True
 
             chunk_group.append(chunk)
             chunk.append_tensor(tensor)
@@ -101,15 +117,16 @@ class ChunkManager:
         for group_name in self.chunk_groups:
             self.__close_one_chunk(self.chunk_groups[group_name][-1])
 
-    def access_chunk(self, chunk: Chunk) -> None:
+    def access_chunk(self, chunk: Chunk, async_access: bool = False) -> Optional[dist.Work]:
         """Make the chunk can be used for calculation."""
         if chunk in self.accessed_chunks:
-            return
+            return None
         self.__sub_memory_usage(chunk.memory_usage)
         if chunk.device_type == "cpu":
-            chunk.shard_move(get_current_device())
-        self.__add_accessed_chunk(chunk)
+            chunk.shard_move(get_accelerator().get_current_device(), non_blocking=async_access)
+        maybe_work = self.__add_accessed_chunk(chunk, async_access=async_access)
         self.__add_memory_usage(chunk.memory_usage)
+        return maybe_work
 
     def release_chunk(self, chunk: Chunk) -> None:
         """Scatter the chunk in CUDA."""
@@ -120,12 +137,12 @@ class ChunkManager:
             self.__sub_accessed_chunk(chunk)
             self.__add_memory_usage(chunk.memory_usage)
 
-    def move_chunk(self, chunk: Chunk, device: torch.device, force_copy: bool = False) -> None:
+    def move_chunk(self, chunk: Chunk, device: torch.device, force_copy: bool = False, async_move=False) -> None:
         """Move the shard of the chunk to the target device."""
         if not chunk.can_move or chunk.device_type == device.type:
             return
         self.__sub_memory_usage(chunk.memory_usage)
-        chunk.shard_move(device, force_copy)
+        chunk.shard_move(device, force_copy, non_blocking=async_move)
         self.__add_memory_usage(chunk.memory_usage)
 
     def trans_tensor_state(self, tensor: torch.Tensor, state: TensorState) -> None:
@@ -133,12 +150,12 @@ class ChunkManager:
         chunk = self.tensor_chunk_map[tensor]
         chunk.tensor_trans_state(tensor, state)
 
-    def reduce_chunk(self, chunk: Chunk) -> bool:
+    def reduce_chunk(self, chunk: Chunk, async_op: bool = False) -> bool:
         """Reduce or all reduce the chunk."""
         if not chunk.can_reduce:
             return False
         self.__sub_memory_usage(chunk.memory_usage)
-        chunk.reduce()
+        chunk.reduce(async_op=async_op)
         self.__sub_accessed_chunk(chunk)
         self.__add_memory_usage(chunk.memory_usage)
         return True
@@ -241,10 +258,11 @@ class ChunkManager:
         for k, v in usage.items():
             self.total_mem[k] += v
 
-    def __add_accessed_chunk(self, chunk: Chunk):
-        chunk.access_chunk()
+    def __add_accessed_chunk(self, chunk: Chunk, async_access: bool = False) -> Optional[dist.Work]:
+        maybe_work = chunk.access_chunk(async_access=async_access)
         self.accessed_chunks.add(chunk)
         self.accessed_mem += chunk.chunk_mem
+        return maybe_work
 
     def __sub_accessed_chunk(self, chunk: Chunk):
         chunk.release_chunk()
@@ -262,7 +280,7 @@ class ChunkManager:
         return grad_chunk
 
     def rearrange_accumulated_grad_chunk(self, chunk: Chunk) -> Chunk:
-        """Rearrange gradients accumulated in chunk.grad_chunk, and getP prepared for gradient reduction."""
+        """Rearrange gradients accumulated in chunk.grad_chunk, and get prepared for gradient reduction."""
 
         assert chunk.grad_chunk is not None
 
@@ -276,7 +294,10 @@ class ChunkManager:
                 accumulated_grad = chunk.grad_chunk.cuda_shard.clone().detach().mul_(chunk.pg_size)
             else:
                 accumulated_grad = (
-                    chunk.grad_chunk.cpu_shard.to(get_current_device()).clone().detach().mul_(chunk.pg_size)
+                    chunk.grad_chunk.cpu_shard.to(get_accelerator().get_current_device())
+                    .clone()
+                    .detach()
+                    .mul_(chunk.pg_size)
                 )
             accumulated_grad_gathered = False
 

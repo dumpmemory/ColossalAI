@@ -52,6 +52,9 @@ config = MistralConfig(
     hidden_size=256, intermediate_size=256, num_attention_heads=64, num_hidden_layers=2, vocab_size=50258
 )
 
+if hasattr(config, "pad_token_id"):
+    config.pad_token_id = config.eos_token_id
+
 model_zoo.register(
     name="transformers_mistral",
     model_fn=lambda: transformers.MistralModel(config),
@@ -61,7 +64,7 @@ model_zoo.register(
     model_attribute=ModelAttribute(has_control_flow=True),
 )
 model_zoo.register(
-    name="transformers_mistral_for_casual_lm",
+    name="transformers_mistral_for_causal_lm",
     model_fn=lambda: transformers.MistralForCausalLM(config),
     data_gen_fn=data_gen_for_lm,
     output_transform_fn=output_transform_fn,

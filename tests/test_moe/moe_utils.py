@@ -1,90 +1,98 @@
+import os
+import traceback
+from contextlib import contextmanager
+from time import sleep
+from typing import Callable, List, Optional
+
 import torch
 import torch.distributed as dist
-import torch.nn as nn
-
-from colossalai.legacy.engine.gradient_handler._base_gradient_handler import BaseGradientHandler
-from colossalai.legacy.engine.gradient_handler.utils import bucket_allreduce
-from colossalai.legacy.registry import GRADIENT_HANDLER
-from colossalai.moe import SparseMLP
-from colossalai.moe.manager import MOE_MANAGER
-from colossalai.moe.utils import get_moe_epsize_param_dict
+from torch.utils._pytree import tree_map
 
 
-class MoeModel(nn.Module):
-    def __init__(self, enable_load_balance: bool = False):
-        class TestSubModule(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.moe = SparseMLP(
-                    num_experts=8, hidden_size=16, intermediate_size=32, enable_load_balance=enable_load_balance
-                )
-                self.proj = nn.Linear(16, 4)
-
-            def forward(self, x):
-                x = self.moe(x)
-                x = self.proj(x)
-                return x
-
-        super().__init__()
-        self.test_embed = nn.Linear(4, 16)
-        self.test_transform = TestSubModule()
-
-    def forward(self, x):
-        MOE_MANAGER.reset_loss()
-
-        x = self.test_embed(x)
-        x = self.test_transform(x)
-
-        return x
+def assert_loose_close(a, b, dtype: torch.dtype = torch.float32, name=""):
+    assert loose_close(a, b, dtype), f"{name} not close {a.mean()} {b.mean()}"
 
 
-@GRADIENT_HANDLER.register_module
-class MoeGradientHandler(BaseGradientHandler):
-    """A helper class to handle all-reduce operations in a data parallel group and
-    moe model parallel. A all-reduce collective communication will be operated in
-    :func:`handle_gradient` among a data parallel group.
-    For better performance, it bucketizes the gradients of all parameters that are
-    the same type to improve the efficiency of communication.
+def loose_close(a, b, dtype: torch.dtype = torch.float32):
+    rtol = None
+    atol = None
+    if dtype is torch.float16:
+        rtol = 5e-2
+        atol = 5e-4
+    elif dtype is torch.bfloat16:
+        rtol = 4e-3
+        atol = 4e-3
+    else:
+        assert dtype is torch.float32
+        rtol = 1e-05
+        atol = 1e-08
 
-    Args:
-        model (Module): Model where the gradients accumulate.
-        optimizer (Optimizer): Optimizer for updating the parameters.
-    """
+    a = a.detach().to(dtype)
+    b = b.detach().to(dtype).to(a.device)
 
-    def __init__(self, model, optimizer=None):
-        super().__init__(model, optimizer)
-
-    def handle_gradient(self):
-        """A method running an all-reduce operation in a data parallel group.
-        Then running an all-reduce operation for all parameters in experts
-        across moe model parallel group
-        """
-        if dist.get_world_size() > 1:
-            epsize_param_dict = get_moe_epsize_param_dict(self._model)
-
-            # epsize is 1, indicating the params are replicated among processes in data parallelism
-            # use the ParallelMode.DATA to get data parallel group
-            # reduce gradients for all parameters in data parallelism
-            if 1 in epsize_param_dict:
-                bucket_allreduce(param_list=epsize_param_dict[1])
-
-            for ep_size in epsize_param_dict:
-                if ep_size != 1 and ep_size != MOE_MANAGER.world_size:
-                    bucket_allreduce(
-                        param_list=epsize_param_dict[ep_size], group=MOE_MANAGER.parallel_info_dict[ep_size].dp_group
-                    )
+    return torch.allclose(a, b, rtol=rtol, atol=atol)
 
 
-def assert_not_equal_in_group(tensor, process_group=None):
-    # all gather tensors from different ranks
-    world_size = dist.get_world_size(process_group)
-    tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]
-    dist.all_gather(tensor_list, tensor, group=process_group)
+def check_model_equal(model1, model2, dtype):
+    assert set(model1.state_dict().keys()) == set(model2.state_dict().keys())
+    for i, ((name, p1), p2) in enumerate(zip(model1.named_parameters(), model2.parameters())):
+        assert_loose_close(p1, p2, dtype, name=name)
 
-    # check if they are equal one by one
-    for i in range(world_size - 1):
-        a = tensor_list[i]
-        b = tensor_list[i + 1]
-        assert not torch.allclose(a, b), \
-            (f"expected tensors on rank {i} and {i + 1} not to be equal "
-             f"but they are, {a} vs {b}")
+
+@contextmanager
+def distributed_debug_mode(num_stacks: int = 1, funcs_to_patch: Optional[List[Callable]] = None, enable=True):
+    if enable:
+        assert (
+            os.environ.get("CUDA_LAUNCH_BLOCKING", "0") == "1"
+        ), f"Expect CUDA_LAUNCH_BLOCKING=1, got {os.environ.get('CUDA_LAUNCH_BLOCKING', '0')}"
+    if funcs_to_patch is None:
+        funcs_to_patch = [
+            dist.all_reduce,
+            dist.all_reduce_coalesced,
+            dist.all_gather,
+            dist.all_gather_coalesced,
+            dist.all_gather_into_tensor,
+            dist.all_to_all,
+            dist.all_to_all_single,
+            dist.reduce_scatter,
+        ]
+
+    original_funcs = {}
+    patched_funcs = {}
+
+    def make_patched(func):
+        def patched_func(*args, **kwargs):
+            stack = traceback.format_stack()
+
+            def format_node(node):
+                if isinstance(node, torch.Tensor):
+                    return f"{node.shape}"
+                elif isinstance(node, list):
+                    return f"[{', '.join([format_node(n) for n in node])}]"
+
+                return str(node)
+
+            args_str, kwargs_str = tree_map(format_node, (args, kwargs))
+            en = len(stack) - 1
+            st = max(0, en - num_stacks)
+            dist.barrier()
+            sleep(0.001 * dist.get_rank())
+            print(
+                f"[Rank {dist.get_rank()}-{func.__name__}-{dist.get_process_group_ranks(kwargs.get('group', dist.group.WORLD))}]: Called from {''.join(stack[st:en])}args={args_str} kwargs={kwargs_str}\n"
+            )
+            dist.barrier()
+            return func(*args, **kwargs)
+
+        return patched_func
+
+    if enable:
+        for func in funcs_to_patch:
+            original_funcs[func.__name__] = getattr(dist, func.__name__)
+            patched_funcs[func.__name__] = make_patched(func)
+            setattr(dist, func.__name__, patched_funcs[func.__name__])
+
+    try:
+        yield
+    finally:
+        for func_name, original_func in original_funcs.items():
+            setattr(dist, func_name, original_func)

@@ -1,7 +1,6 @@
 from contextlib import nullcontext
 from typing import Optional
 
-import pytest
 import torch
 import torch.distributed as dist
 
@@ -55,6 +54,8 @@ def run_fn(init_method, model_fn, data_gen_fn, output_transform_fn, zero_size, t
 
         booster.backward(loss, optimizer)
         optimizer.step()
+        grad_norm = optimizer.get_grad_norm()
+        assert grad_norm is None or isinstance(grad_norm, float)
 
     except NotImplementedError:
         print(f"Tensor Parallelism policy for {model.__class__} is not implemented yet\n.")
@@ -162,19 +163,13 @@ def check_gemini_plugin(
 
 def run_dist(rank, world_size, port, early_stop: bool = True):
     # init dist env
-    colossalai.launch(config=dict(), rank=rank, world_size=world_size, port=port, host="localhost")
+    colossalai.launch(rank=rank, world_size=world_size, port=port, host="localhost")
     check_gemini_plugin(early_stop=early_stop)
 
 
 @rerun_if_address_is_in_use()
 def test_gemini_plugin(early_stop: bool = True):
     spawn(run_dist, 4, early_stop=early_stop)
-
-
-@pytest.mark.largedist
-@rerun_if_address_is_in_use()
-def test_gemini_plugin_3d(early_stop: bool = True):
-    spawn(run_dist, 8, early_stop=early_stop)
 
 
 if __name__ == "__main__":

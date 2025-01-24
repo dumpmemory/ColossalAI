@@ -10,12 +10,12 @@ try:
 except:
     NO_CODEGEN = True
 
+from colossalai.accelerator import get_accelerator
 from colossalai.device.device_mesh import DeviceMesh
 from colossalai.initialize import launch
 from colossalai.logging import disable_existing_loggers
 from colossalai.nn.optimizer import HybridAdam
 from colossalai.testing import assert_close, rerun_if_address_is_in_use, run_on_environment_flag, spawn
-from colossalai.utils import get_current_device
 from colossalai.zero import zero_model_wrapper, zero_optim_wrapper
 
 
@@ -34,7 +34,7 @@ class MLP(torch.nn.Module):
 
 def check_auto_parallel_with_gemini(rank, world_size, port):
     disable_existing_loggers()
-    launch(config={}, rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
+    launch(rank=rank, world_size=world_size, host="localhost", port=port, backend="nccl")
     model = MLP(4).half().cuda()
     if rank in [0, 1]:
         input = torch.arange(0, 16).reshape(4, 4).half().cuda()
@@ -72,7 +72,11 @@ def check_auto_parallel_with_gemini(rank, world_size, port):
         print("=" * msg_length)
 
     gemini_config = dict(
-        strict_ddp_mode=False, device=get_current_device(), placement_policy="cpu", pin_memory=True, search_range_m=128
+        strict_ddp_mode=False,
+        device=get_accelerator().get_current_device(),
+        placement_policy="cpu",
+        pin_memory=True,
+        search_range_m=128,
     )
 
     gm = zero_model_wrapper(gm, zero_stage=3, gemini_config=gemini_config)

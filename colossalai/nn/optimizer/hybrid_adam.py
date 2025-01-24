@@ -2,8 +2,8 @@ from typing import Any, Optional
 
 import torch
 
-from colossalai.kernel.op_builder import FusedOptimBuilder
-from colossalai.utils import multi_tensor_applier
+from colossalai.kernel.kernel_loader import FusedOptimizerLoader
+from colossalai.utils import get_current_device, multi_tensor_applier
 
 from .cpu_adam import CPUAdam
 
@@ -85,9 +85,9 @@ class HybridAdam(CPUAdam):
             nvme_offload_dir,
         )
         if torch.cuda.is_available():
-            fused_optim = FusedOptimBuilder().load()
+            fused_optim = FusedOptimizerLoader().load()
             self.gpu_adam_op = fused_optim.multi_tensor_adam
-            self._dummy_overflow_buf = torch.cuda.IntTensor([0])
+            self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
 
     @torch.no_grad()
     def step(self, closure=None, div_scale: float = -1):

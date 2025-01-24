@@ -81,7 +81,7 @@ default_inference_kwargs = {
     "calculate_loss": True,
     "all_classes": ["A", "B", "C", "D"],
     "language": "Chinese",
-    "pretrain": False,
+    "calculate_overall_loss": False,
     "max_new_tokens": 32,
 }
 
@@ -101,9 +101,7 @@ class CMMLUDataset(BaseDataset):
     """
 
     @staticmethod
-    def load(
-        path: str, logger: DistributedLogger, few_shot: bool, forward_only: bool, load_train: bool, load_reference: bool
-    ) -> List[Dict]:
+    def load(path: str, logger: DistributedLogger, few_shot: bool, *args, **kwargs) -> List[Dict]:
         dataset = {"dev": {}, "test": {}}
         for split in ["dev", "test"]:
             files = os.listdir(os.path.join(path, split))

@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+from torch.distributed.distributed_c10d import GroupMember
 
 
 def prod(nums: List[int]) -> int:
@@ -38,11 +39,16 @@ class ProcessGroupMesh:
 
     def __init__(self, *size: int) -> None:
         assert dist.is_initialized(), "Please initialize torch.distributed first."
-        assert prod(size) == dist.get_world_size(), "The product of the size must be equal to the world size."
+        world_size = dist.get_world_size()
+        prod_size = prod(size)
+        assert (
+            prod_size == world_size
+        ), f"The product of the size({prod_size}) must be equal to the world size({world_size})."
+
         self._shape = size
         self._rank = dist.get_rank()
         self._coord = ProcessGroupMesh.unravel(self._rank, self._shape)
-        self._ranks_to_group: Dict[Tuple[int, ...], ProcessGroup] = {}
+        self._ranks_to_group: Dict[Tuple[int, ...], Union[ProcessGroup, GroupMember.NON_GROUP_MEMBER]] = {}
         self._group_to_ranks: Dict[ProcessGroup, Tuple[int, ...]] = {}
 
     def destroy_mesh_process_groups(self):
@@ -129,9 +135,9 @@ class ProcessGroupMesh:
         """
 
         assert mode in ["raise", "wrap", "clip"]
-        return np.ravel_multi_index(coord, shape, mode)
+        return int(np.ravel_multi_index(coord, shape, mode))
 
-    def get_group(self, ranks_in_group: List[int], backend: Optional[str] = None) -> ProcessGroup:
+    def _get_group(self, ranks_in_group: List[int], backend: Optional[str] = None) -> ProcessGroup:
         """Get the process group with the given ranks. It the process group doesn't exist, it will be created.
 
         Args:
@@ -142,10 +148,11 @@ class ProcessGroupMesh:
             ProcessGroup: The process group with the given ranks.
         """
         ranks_in_group = sorted(ranks_in_group)
-        if tuple(ranks_in_group) not in self._group_to_ranks:
+        if tuple(ranks_in_group) not in self._ranks_to_group:
             group = dist.new_group(ranks_in_group, backend=backend)
             self._ranks_to_group[tuple(ranks_in_group)] = group
-            self._group_to_ranks[group] = tuple(ranks_in_group)
+            if group is not GroupMember.NON_GROUP_MEMBER:
+                self._group_to_ranks[group] = tuple(ranks_in_group)
         return self._ranks_to_group[tuple(ranks_in_group)]
 
     def get_ranks_in_group(self, group: ProcessGroup) -> List[int]:
@@ -161,7 +168,7 @@ class ProcessGroupMesh:
 
     @staticmethod
     def get_coords_along_axis(
-        base_coord: Tuple[int, ...], axis: int, indices_at_axis: List[int]
+        base_coord: Tuple[int, ...], axis: Union[int, List[int]], indices_at_axis: Union[List[int], List[List[int]]]
     ) -> List[Tuple[int, ...]]:
         """Get coordinates along the given axis.
 
@@ -173,13 +180,35 @@ class ProcessGroupMesh:
         Returns:
             List[Tuple[int, ...]]: Coordinates along the axis.
         """
-        coords_in_group = []
-        for idx in indices_at_axis:
-            coords_in_group.append(base_coord[:axis] + (idx,) + base_coord[axis + 1 :])
+        if isinstance(axis, int):
+            axis = [
+                axis,
+            ]
+            assert isinstance(indices_at_axis[0], int), f"Expected int, but got {type(indices_at_axis[0])}."
+            indices_at_axis = [
+                indices_at_axis,
+            ]
+
+        def add_index(base_coord, axis, indices_at_axis):
+            coords_in_group = []
+            for idx in indices_at_axis:
+                coords_in_group.append(base_coord[:axis] + (idx,) + base_coord[axis + 1 :])
+            return coords_in_group
+
+        coords_in_group = [base_coord]
+        for ax, indices_at_ax in zip(axis, indices_at_axis):
+            new_coords_in_group = []
+            for coords in coords_in_group:
+                new_coords_in_group += add_index(coords, ax, indices_at_ax)
+            coords_in_group = new_coords_in_group
+
         return coords_in_group
 
     def create_group_along_axis(
-        self, axis: int, indices_at_axis: Optional[List[int]] = None, backend: Optional[str] = None
+        self,
+        axis: Union[int, List[int]],
+        indices_at_axis: Optional[Union[List[int], List[List[int]]]] = None,
+        backend: Optional[str] = None,
     ) -> ProcessGroup:
         """Create all process groups along the given axis, and return the one which the current process belongs to.
 
@@ -191,38 +220,54 @@ class ProcessGroupMesh:
         Returns:
             ProcessGroup: The process group along the given axis which the current process belongs to.
         """
-        indices_at_axis = indices_at_axis or list(range(self._shape[axis]))
+        if isinstance(axis, int):
+            axis = [
+                axis,
+            ]
+            if indices_at_axis is not None:
+                assert isinstance(indices_at_axis[0], int)
+                indices_at_axis = [
+                    indices_at_axis,
+                ]
+
+        indices_at_axis = indices_at_axis or [list(range(self._shape[ax])) for ax in axis]
         reduced_shape = list(self._shape)
         # the choices on the axis are reduced to 1, since it's determined by `indices_at_axis`
-        reduced_shape[axis] = 1
+        for ax in axis:
+            reduced_shape[ax] = 1
         target_group = None
         # use Cartesian product to generate all combinations of coordinates
         for base_coord in itertools.product(*[range(s) for s in reduced_shape]):
             coords_in_group = ProcessGroupMesh.get_coords_along_axis(base_coord, axis, indices_at_axis)
             ranks_in_group = tuple([ProcessGroupMesh.ravel(coord, self._shape) for coord in coords_in_group])
-            group = self.get_group(ranks_in_group, backend=backend)
+            group = self._get_group(ranks_in_group, backend=backend)
             if self._rank in ranks_in_group:
                 target_group = group
         return target_group
 
     def get_group_along_axis(
-        self, axis: int, indices_at_axis: Optional[List[int]] = None, backend: Optional[str] = None
+        self, axis: Union[int, List[int]], indices_at_axis: Optional[List[int]] = None, backend: Optional[str] = None
     ) -> ProcessGroup:
         """Get the process group along the given axis which the current process belongs to. If the process group doesn't exist, it will be created.
 
         Args:
-            axis (int): Axis along which the process groups are created.
+            axis (int or list of int): Axes along which the process groups are created.
             indices_at_axis (Optional[List[int]], optional): Indices at the axis. Defaults to None.
             backend (Optional[str], optional): Backend of the process group. Defaults to None.
 
         Returns:
             ProcessGroup: The process group along the given axis which the current process belongs to.
         """
-        indices_at_axis = indices_at_axis or list(range(self._shape[axis]))
+        indices_at_axis = indices_at_axis
+        if indices_at_axis is None:
+            if isinstance(axis, (list, tuple)):
+                indices_at_axis = list(list(range(self._shape[ax])) for ax in axis)
+            else:
+                indices_at_axis = list(range(self._shape[axis]))
+
         coords_in_group = ProcessGroupMesh.get_coords_along_axis(self._coord, axis, indices_at_axis)
         ranks_in_group = tuple([ProcessGroupMesh.ravel(coord, self._shape) for coord in coords_in_group])
         if ranks_in_group not in self._ranks_to_group:
             # no need to cache it explicitly, since it will be cached in `create_group_along_axis`
             return self.create_group_along_axis(axis, indices_at_axis, backend=backend)
         return self._ranks_to_group[ranks_in_group]
-    

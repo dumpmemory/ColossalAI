@@ -1,6 +1,7 @@
-from typing import Union
+from typing import Dict, Optional, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 from torch.optim import Optimizer
@@ -48,14 +49,31 @@ class OptimizerWrapper:
         """
         self.optim.zero_grad(*args, **kwargs)
 
-    def backward(self, loss: Tensor, *args, **kwargs):
+    def backward(self, loss: Tensor, inputs=None, retain_graph=False, **kwargs):
         """
         Performs a backward pass on the loss.
         """
-        loss.backward(*args, **kwargs)
+        loss.backward(inputs=inputs, retain_graph=retain_graph, **kwargs)
 
-    def backward_by_grad(self, tensor: Tensor, grad: Tensor):
-        torch.autograd.backward(tensor, grad)
+    def backward_by_grad(self, tensor: Tensor, grad: Tensor, inputs: Tensor = None, retain_graph: bool = False):
+        """
+        Performs a backward pass for dx or dw,
+        for dx, we only calculate dx = w*dy here
+        for dw, we only calculate dw = x*dy here
+
+        Args:
+            tensor (Tensor): y or loss of current chunk;
+            grad_tensors (Tensor): dy of current chunk;
+            input_obj (Tensor): for dx, input_obj is x of current chunk;
+                                for dw, input_obj is w of current chunk;
+            retain_graph (bool): default to be True, we retain graph in backward_b
+        """
+        torch.autograd.backward(
+            tensors=tensor,
+            grad_tensors=grad,
+            inputs=inputs,
+            retain_graph=retain_graph,
+        )
 
     def state_dict(self):
         """
@@ -133,3 +151,37 @@ class OptimizerWrapper:
         Unwrap the optimizer for checkpoint saving/loading.
         """
         return self.optim
+
+    def get_grad_norm(self, norm_type: Union[float, int] = 2.0, **kwargs) -> Optional[float]:
+        """
+        Returns the gradient norm of an iterable of parameters. This method should be called after optimizer.step().
+
+        Args:
+            norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for infinity norm.
+
+        Returns:
+            Optional[float]: Total norm of the gradients (viewed as a single vector). If there are no valid gradients, returns None.
+        """
+        raise NotImplementedError("The method get_grad_norm is not implemented yet.")
+
+
+class DistributedOptim(Optimizer):
+    def setup_distributed(
+        self,
+        tp_group: Optional[dist.ProcessGroup] = None,
+        dp_group: Optional[dist.ProcessGroup] = None,
+        shard_to_working_param: Optional[Dict] = {},
+        padding_map: Optional[Dict] = None,
+        is_zero: Optional[bool] = False,
+    ):
+        """Assign process groups for TP and ZeRO 2.
+        Arguments:
+            tp_group (dist.ProcessGroup): Tensor Parallel process group
+            dp_group (dist.ProcessGroup): ZeRO stage 2 process group
+            shard_to_working_param (Dict): ZeRO stage 2 feeds the optimizer a sharded param view to match grad shape.
+                This maps from id(view) to model params used in forward & backward.
+            padding_map (Dict): Per-param padding from ZeRO stage 2
+            is_zero (bool): Whether to use ZeRO stage 2.
+        """
+
+        raise NotImplementedError("setup_distributed for TP/DP isn't supported by this optimizer yet!")

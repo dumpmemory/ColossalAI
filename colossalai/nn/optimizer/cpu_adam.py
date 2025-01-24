@@ -1,10 +1,9 @@
 import math
-import platform
 from typing import Optional
 
 import torch
 
-from colossalai.kernel.op_builder import ArmCPUAdamBuilder, CPUAdamBuilder
+from colossalai.kernel.kernel_loader import CPUAdamLoader
 
 from .nvme_optimizer import NVMeOptimizer
 
@@ -78,9 +77,17 @@ class CPUAdam(NVMeOptimizer):
         default_args = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, bias_correction=bias_correction)
         super(CPUAdam, self).__init__(model_params, default_args, nvme_offload_fraction, nvme_offload_dir)
         self.adamw_mode = adamw_mode
-        cpu_adam = ArmCPUAdamBuilder().load() if platform.machine() == "aarch64" else CPUAdamBuilder().load()
-        # if you find yourself stuck here, make sure that you install colossalai with CUDA_EXT=1 specification
+        cpu_adam = CPUAdamLoader().load()
+        # if you find yourself stuck here, make sure that you install colossalai with BUILD_EXT=1 specification
         self.cpu_adam_op = cpu_adam.CPUAdamOptimizer(lr, betas[0], betas[1], eps, weight_decay, adamw_mode)
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                if "step" in state and isinstance(state["step"], torch.Tensor):
+                    state["step"] = int(state["step"].item())
 
     def torch_adam_update(
         self,

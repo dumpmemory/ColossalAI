@@ -8,7 +8,7 @@ Licensed under the MIT License.
 """
 import torch
 
-from colossalai.utils import multi_tensor_applier
+from colossalai.utils import get_current_device, multi_tensor_applier
 
 
 class FusedAdam(torch.optim.Optimizer):
@@ -70,12 +70,12 @@ class FusedAdam(torch.optim.Optimizer):
         self.adamw_mode = 1 if adamw_mode else 0
         self.set_grad_none = set_grad_none
         if multi_tensor_applier.available:
-            from colossalai.kernel.op_builder import FusedOptimBuilder
+            from colossalai.kernel.kernel_loader import FusedOptimizerLoader
 
-            fused_optim = FusedOptimBuilder().load()
+            fused_optim = FusedOptimizerLoader().load()
 
             # Skip buffer
-            self._dummy_overflow_buf = torch.cuda.IntTensor([0])
+            self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
             self.multi_tensor_adam = fused_optim.multi_tensor_adam
         else:
             raise RuntimeError("FusedAdam requires cuda extensions")

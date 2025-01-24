@@ -51,7 +51,7 @@ Author: [Baizhou Zhang](https://github.com/Fridge003), [Bin Jia](https://github.
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">✔️</td>
-    <td nowrap="nowrap" align="center">❌</td>
+    <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">❌</td>
   </tr>
   <tr>
@@ -71,8 +71,8 @@ Author: [Baizhou Zhang](https://github.com/Fridge003), [Bin Jia](https://github.
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">✔️</td>
-    <td nowrap="nowrap" align="center">✔️</td>
-    <td nowrap="nowrap" align="center">✔️</td>
+    <td nowrap="nowrap" align="center">❌</td>
+    <td nowrap="nowrap" align="center">❌</td>
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">✔️</td>
@@ -95,8 +95,8 @@ Author: [Baizhou Zhang](https://github.com/Fridge003), [Bin Jia](https://github.
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">✔️</td>
-    <td nowrap="nowrap" align="center">✔️</td>
-    <td nowrap="nowrap" align="center">✔️</td>
+    <td nowrap="nowrap" align="center">❌</td>
+    <td nowrap="nowrap" align="center">❌</td>
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">✔️</td>
@@ -155,8 +155,8 @@ Author: [Baizhou Zhang](https://github.com/Fridge003), [Bin Jia](https://github.
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">❌</td>
     <td nowrap="nowrap" align="center">❌</td>
-    <td nowrap="nowrap" align="center">✔️</td>
-    <td nowrap="nowrap" align="center">✔️</td>
+    <td nowrap="nowrap" align="center">❌</td>
+    <td nowrap="nowrap" align="center">❌</td>
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">✔️</td>
     <td nowrap="nowrap" align="center">❌</td>
@@ -264,7 +264,7 @@ elif args.plugin == "hybrid_parallel":
 3. 通过调用`Booster.execute_pipeline` 方法来执行前向和后向传递:
     ```python
     outputs = booster.execute_pipeline(
-        train_dataloader_iter, model, _criterion, optimizer, return_loss=True, return_outputs=True
+        train_dataloader_iter, model, _criterion, optimizer, return_loss=True
     )
     ```
     该方法会自动执行后向传递，所以在执行该方法后不需要再调用 `loss.backward()`方法。
@@ -302,13 +302,6 @@ if dist.get_world_size() > 1:
 1. 当启用流水线并行时，请不要用常规方式（`model(input)`、`loss.backward()`）进行前向/后向传递，这样会导致未知的错误。这种情形下请通过调用`booster.execute_pipeline`方法来进行前向/后向传递。
 
 2. 当使用Shardformer处理`GPT2ForSequenceClassification`、`ViTForImageClassification`等分类模型时，请确保labels的总数为张量并行度的整数倍，否则Shardformer无法正确地处理classifier层。一个简单的修复方法就是在transformers的config中添加虚拟的标签。这一bug将在 Shardformer的未来版本中修复。
-
-3. 训练ChatGLM-2 6B的情况有点特殊：由于Huggingface Transformers 目前尚未正式支持ChatGLM。在使用Shardformer训练ChatGLM-2时，请通过以下方式导入config/model的类：
-    ```python
-    from colossalai.shardformer.modeling.chatglm2_6b.configuration_chatglm import ChatGLMConfig
-    from colossalai.shardformer.modeling.chatglm2_6b.modeling_chatglm import ChatGLMForConditionalGeneration, ChatGLMModel
-    ```
-    并且使用这些导入的类初始化模型。
 
 
 ## Shardformer的工作原理

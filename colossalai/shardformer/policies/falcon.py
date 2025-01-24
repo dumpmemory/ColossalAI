@@ -10,7 +10,7 @@ import colossalai.shardformer.layer as col_nn
 from ..modeling.falcon import (
     FalconPipelineForwards,
     build_falcon_alibi_tensor_fn,
-    get_falcon_flash_attention_forward,
+    get_lm_forward_with_dist_cross_entropy,
     get_tp_falcon_decoder_layer_forward,
 )
 from .base_policy import ModulePolicyDescription, Policy, SubModuleReplacementDescription
@@ -21,35 +21,20 @@ __all__ = ["FalconPolicy"]
 class FalconPolicy(Policy):
     def __init__(self) -> None:
         super().__init__()
-        import transformers
-        from packaging.version import Version
-
-        assert Version(transformers.__version__) <= Version(
-            "4.33.0"
-        ), "The Falcon model should run on a transformers version not greater than 4.33.0."
 
     def config_sanity_check(self):
         pass
 
     def preprocess(self):
-        # reshape the embedding layer
-        r"""
-        Reshape the Embedding layer to make the embedding dimension divisible by world_size
-        """
-        if self.shard_config.enable_tensor_parallelism:
-            vocab_size = self.model.config.vocab_size
-            world_size = self.shard_config.tensor_parallel_size
-            if vocab_size % world_size != 0:
-                new_vocab_size = vocab_size + world_size - vocab_size % world_size
-                self.model.resize_token_embeddings(new_vocab_size)
+        self.tie_weight = self.tie_weight_check()
         return self.model
 
     def module_policy(self):
-        from transformers.models.falcon.modeling_falcon import FalconAttention, FalconDecoderLayer, FalconModel
+        from transformers.models.falcon.modeling_falcon import FalconDecoderLayer, FalconModel
 
         if not self.model.config.new_decoder_architecture and self.model.config.multi_query:
             warnings.warn(
-                "Falcon dosen't support tensor parallelism when (not new_decoder_architecture and multi_query) is True, will ignore the tensor parallelism flag."
+                "Falcon doesn't support tensor parallelism when (not new_decoder_architecture and multi_query) is True, will ignore the tensor parallelism flag."
             )
             self.shard_config.enable_tensor_parallelism = False
 
@@ -58,7 +43,23 @@ class FalconPolicy(Policy):
             warnings.warn("Falcon doesn't support sequence parallelism now, will ignore the sequence parallelism flag.")
 
         policy = {}
+
+        embedding_cls = None
         if self.shard_config.enable_tensor_parallelism:
+            embedding_cls = col_nn.VocabParallelEmbedding1D
+        else:
+            if self.tie_weight:
+                embedding_cls = col_nn.PaddingEmbedding
+
+        use_zbv = self.pipeline_stage_manager is not None and self.pipeline_stage_manager.use_zbv
+
+        if self.shard_config.enable_tensor_parallelism:
+            assert (
+                self.model.config.num_attention_heads % self.shard_config.tensor_parallel_size == 0
+            ), f"The number of attention heads must be divisible by tensor parallel size."
+            assert (
+                self.model.config.num_kv_heads % self.shard_config.tensor_parallel_size == 0
+            ), f"The number of key_value heads must be divisible by tensor parallel size."
             attn_attribute_replacement = {
                 "self_attention.hidden_size": self.model.config.hidden_size // self.shard_config.tensor_parallel_size,
                 "self_attention.split_size": self.model.config.hidden_size // self.shard_config.tensor_parallel_size,
@@ -74,10 +75,16 @@ class FalconPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="self_attention.query_key_value",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs=dict(
+                            use_zbv=use_zbv,
+                        ),
                     ),
                     SubModuleReplacementDescription(
                         suffix="self_attention.dense",
                         target_module=col_nn.Linear1D_Row,
+                        kwargs=dict(
+                            use_zbv=use_zbv,
+                        ),
                     ),
                     SubModuleReplacementDescription(
                         suffix="self_attention.attention_dropout",
@@ -86,8 +93,17 @@ class FalconPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="mlp.dense_h_to_4h",
                         target_module=col_nn.Linear1D_Col,
+                        kwargs=dict(
+                            use_zbv=use_zbv,
+                        ),
                     ),
-                    SubModuleReplacementDescription(suffix="mlp.dense_4h_to_h", target_module=col_nn.Linear1D_Row),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.dense_4h_to_h",
+                        target_module=col_nn.Linear1D_Row,
+                        kwargs=dict(
+                            use_zbv=use_zbv,
+                        ),
+                    ),
                 ],
             )
 
@@ -98,12 +114,64 @@ class FalconPolicy(Policy):
                 method_replacement={
                     "build_alibi_tensor": build_falcon_alibi_tensor_fn(self.shard_config.tensor_parallel_process_group)
                 },
+            )
+        elif use_zbv:
+            policy[FalconDecoderLayer] = ModulePolicyDescription(
+                method_replacement={"forward": get_tp_falcon_decoder_layer_forward()},
                 sub_module_replacement=[
                     SubModuleReplacementDescription(
-                        suffix="word_embeddings",
-                        target_module=col_nn.VocabParallelEmbedding1D,
-                    )
+                        suffix="self_attention.query_key_value",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs=dict(
+                            use_zbv=use_zbv,
+                        ),
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="self_attention.dense",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs=dict(
+                            use_zbv=use_zbv,
+                        ),
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="self_attention.attention_dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.dense_h_to_4h",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs=dict(
+                            use_zbv=use_zbv,
+                        ),
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.dense_4h_to_h",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs=dict(
+                            use_zbv=use_zbv,
+                        ),
+                    ),
                 ],
+            )
+
+        if embedding_cls is not None:
+            self.append_or_create_submodule_replacement(
+                description=[
+                    SubModuleReplacementDescription(
+                        suffix="word_embeddings",
+                        target_module=embedding_cls,
+                        kwargs=(
+                            {
+                                "make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by,
+                                "fp8_communication": self.shard_config.fp8_communication,
+                            }
+                            if self.shard_config.enable_tensor_parallelism
+                            else {"make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by}
+                        ),
+                    ),
+                ],
+                policy=policy,
+                target_key=FalconModel,
             )
 
         # optimization configuration
@@ -141,11 +209,8 @@ class FalconPolicy(Policy):
             )
 
         if self.shard_config.enable_flash_attention:
-            self.append_or_create_method_replacement(
-                description={"forward": get_falcon_flash_attention_forward()},
-                policy=policy,
-                target_key=FalconAttention,
-            )
+            warnings.warn("Falcon doesn't support flash attention now, fallback to transformers attention.")
+
         return policy
 
     def postprocess(self):
@@ -161,8 +226,8 @@ class FalconPolicy(Policy):
             else:
                 module = self.model.transformer
 
-            layers_per_stage = Policy.distribute_layers(len(module.h), stage_manager.num_stages)
-            stage_index = Policy.get_stage_index(layers_per_stage, stage_manager.stage)
+            layers_per_stage = stage_manager.distribute_layers(len(module.h))
+            stage_index = stage_manager.get_stage_index(layers_per_stage)
             method_replacement = {
                 "forward": partial(
                     new_forward, stage_manager=stage_manager, stage_index=stage_index, shard_config=self.shard_config
@@ -181,13 +246,26 @@ class FalconPolicy(Policy):
             module = self.model.transformer
         stage_manager = self.pipeline_stage_manager
         held_layers = []
-        layers_per_stage = self.distribute_layers(len(module.h), stage_manager.num_stages)
-        if stage_manager.is_first_stage():
-            held_layers.append(module.word_embeddings)
-        start_idx, end_idx = self.get_stage_index(layers_per_stage, stage_manager.stage)
-        held_layers.extend(module.h[start_idx:end_idx])
-        if stage_manager.is_last_stage():
-            held_layers.append(module.ln_f)
+        if stage_manager.is_interleave:
+            assert stage_manager.num_model_chunks is not None
+            layers_per_stage = stage_manager.distribute_layers(len(module.h))
+            stage_indices = stage_manager.get_stage_index(layers_per_stage)
+            if stage_manager.is_first_stage(ignore_chunk=True):
+                held_layers.append(module.word_embeddings)
+            for start_idx, end_idx in stage_indices:
+                held_layers.extend(module.h[start_idx:end_idx])
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(module.ln_f)
+        else:
+            layers_per_stage = stage_manager.distribute_layers(len(module.h))
+            if stage_manager.is_first_stage():
+                held_layers.append(module.word_embeddings)
+            start_idx, end_idx = stage_manager.get_stage_index(layers_per_stage)
+            held_layers.extend(module.h[start_idx:end_idx])
+            if stage_manager.is_last_stage():
+                held_layers.append(module.ln_f)
 
         return held_layers
 
@@ -232,11 +310,33 @@ class FalconForCausalLMPolicy(FalconPolicy):
         if self.shard_config.enable_tensor_parallelism:
             self.append_or_create_submodule_replacement(
                 description=SubModuleReplacementDescription(
-                    suffix="lm_head", target_module=col_nn.Linear1D_Col, kwargs=dict(gather_output=True)
+                    suffix="lm_head",
+                    target_module=col_nn.VocabParallelLMHead1D,
+                    kwargs=dict(
+                        gather_output=not self.shard_config.parallel_output,
+                        make_vocab_size_divisible_by=self.shard_config.make_vocab_size_divisible_by,
+                    ),
                 ),
                 policy=policy,
                 target_key=FalconForCausalLM,
             )
+            if self.shard_config.parallel_output:
+                method_replacement = {"forward": get_lm_forward_with_dist_cross_entropy(self.shard_config)}
+                self.append_or_create_method_replacement(
+                    description=method_replacement, policy=policy, target_key=FalconForCausalLM
+                )
+
+        else:
+            self.append_or_create_submodule_replacement(
+                description=SubModuleReplacementDescription(
+                    suffix="lm_head",
+                    target_module=col_nn.PaddingLMHead,
+                    kwargs=dict(make_vocab_size_divisible_by=self.shard_config.make_vocab_size_divisible_by),
+                ),
+                policy=policy,
+                target_key=FalconForCausalLM,
+            )
+
         if self.pipeline_stage_manager:
             self.set_pipeline_forward(
                 model_cls=FalconForCausalLM,
@@ -249,8 +349,14 @@ class FalconForCausalLMPolicy(FalconPolicy):
         """Get pipeline layers for current stage."""
         stage_manager = self.pipeline_stage_manager
         held_layers = super().get_held_layers()
-        if stage_manager.is_last_stage():
-            held_layers.append(self.model.lm_head)
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.lm_head)
+        else:
+            if stage_manager.is_last_stage():
+                held_layers.append(self.model.lm_head)
         return held_layers
 
     def get_shared_params(self) -> List[Dict[int, Tensor]]:
@@ -276,11 +382,23 @@ class FalconForSequenceClassificationPolicy(FalconPolicy):
 
         policy = super().module_policy()
 
+        use_zbv = self.pipeline_stage_manager is not None and self.pipeline_stage_manager.use_zbv
+
         # handle tensor parallelism
         if self.shard_config.enable_tensor_parallelism:
             self.append_or_create_submodule_replacement(
                 description=SubModuleReplacementDescription(
-                    suffix="score", target_module=col_nn.Linear1D_Col, kwargs=dict(gather_output=True)
+                    suffix="score", target_module=col_nn.Linear1D_Col, kwargs=dict(gather_output=True, use_zbv=use_zbv)
+                ),
+                policy=policy,
+                target_key=FalconForSequenceClassification,
+            )
+        elif use_zbv:
+            self.append_or_create_submodule_replacement(
+                description=SubModuleReplacementDescription(
+                    suffix="score",
+                    target_module=col_nn.LinearWithGradAccum,
+                    kwargs=dict(gather_output=True, use_zbv=use_zbv),
                 ),
                 policy=policy,
                 target_key=FalconForSequenceClassification,
@@ -298,8 +416,14 @@ class FalconForSequenceClassificationPolicy(FalconPolicy):
         """Get pipeline layers for current stage."""
         stage_manager = self.pipeline_stage_manager
         held_layers = super().get_held_layers()
-        if stage_manager.is_last_stage():
-            held_layers.append(self.model.score)
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.score)
+        else:
+            if stage_manager.is_last_stage():
+                held_layers.append(self.model.score)
         return held_layers
 
     def get_shared_params(self) -> List[Dict[int, Tensor]]:
@@ -316,12 +440,32 @@ class FalconForTokenClassificationPolicy(FalconPolicy):
 
         policy = super().module_policy()
 
+        use_zbv = self.pipeline_stage_manager is not None and self.pipeline_stage_manager.use_zbv
+
         # handle tensor parallelism
         if self.shard_config.enable_tensor_parallelism:
             self.append_or_create_submodule_replacement(
                 description=[
                     SubModuleReplacementDescription(
-                        suffix="classifier", target_module=col_nn.Linear1D_Col, kwargs=dict(gather_output=True)
+                        suffix="classifier",
+                        target_module=col_nn.Linear1D_Col,
+                        kwargs=dict(gather_output=True, use_zbv=use_zbv),
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="dropout",
+                        target_module=col_nn.DropoutForReplicatedInput,
+                    ),
+                ],
+                policy=policy,
+                target_key=FalconForTokenClassification,
+            )
+        elif use_zbv:
+            self.append_or_create_submodule_replacement(
+                description=[
+                    SubModuleReplacementDescription(
+                        suffix="classifier",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs=dict(gather_output=True, use_zbv=use_zbv),
                     ),
                     SubModuleReplacementDescription(
                         suffix="dropout",
@@ -343,9 +487,16 @@ class FalconForTokenClassificationPolicy(FalconPolicy):
         """Get pipeline layers for current stage."""
         stage_manager = self.pipeline_stage_manager
         held_layers = super().get_held_layers()
-        if stage_manager.is_last_stage():
-            held_layers.append(self.model.dropout)
-            held_layers.append(self.model.classifier)
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.dropout)
+                held_layers.append(self.model.classifier)
+        else:
+            if stage_manager.is_last_stage():
+                held_layers.append(self.model.dropout)
+                held_layers.append(self.model.classifier)
         return held_layers
 
     def get_shared_params(self) -> List[Dict[int, Tensor]]:
@@ -362,11 +513,25 @@ class FalconForQuestionAnsweringPolicy(FalconPolicy):
 
         policy = super().module_policy()
 
+        use_zbv = self.pipeline_stage_manager is not None and self.pipeline_stage_manager.use_zbv
+
         # handle tensor parallelism
         if self.shard_config.enable_tensor_parallelism:
             self.append_or_create_submodule_replacement(
                 description=SubModuleReplacementDescription(
-                    suffix="qa_outputs", target_module=col_nn.Linear1D_Col, kwargs=dict(gather_output=True)
+                    suffix="qa_outputs",
+                    target_module=col_nn.Linear1D_Col,
+                    kwargs=dict(gather_output=True, use_zbv=use_zbv),
+                ),
+                policy=policy,
+                target_key=FalconForQuestionAnswering,
+            )
+        elif use_zbv:
+            self.append_or_create_submodule_replacement(
+                description=SubModuleReplacementDescription(
+                    suffix="qa_outputs",
+                    target_module=col_nn.Linear1D_Col,
+                    kwargs=dict(gather_output=True, use_zbv=use_zbv),
                 ),
                 policy=policy,
                 target_key=FalconForQuestionAnswering,
@@ -383,8 +548,14 @@ class FalconForQuestionAnsweringPolicy(FalconPolicy):
         """Get pipeline layers for current stage."""
         held_layers = super().get_held_layers()
         stage_manager = self.pipeline_stage_manager
-        if stage_manager.is_last_stage():
-            held_layers.append(self.model.qa_outputs)
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.qa_outputs)
+        else:
+            if stage_manager.is_last_stage():
+                held_layers.append(self.model.qa_outputs)
         return held_layers
 
     def get_shared_params(self) -> List[Dict[int, Tensor]]:

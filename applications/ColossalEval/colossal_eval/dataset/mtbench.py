@@ -14,7 +14,7 @@ default_inference_kwargs = {
     "calculate_loss": False,
     "all_classes": None,
     "language": "English",
-    "pretrain": False,
+    "calculate_overall_loss": False,
     "max_new_tokens": 1024,
     "turns": 2,
 }
@@ -27,12 +27,12 @@ class MTBenchDataset(BaseDataset):
     This dataset class will convert the original dataset into the inference dataset.
     """
 
-    def __init__(self, path, logger, few_shot):
+    def __init__(self, path, logger: DistributedLogger, *args, **kwargs):
         self.multiturn = True
-        self.dataset = self.load(path, logger, few_shot)
+        self.dataset = self.load(path, logger, *args, **kwargs)
 
     @staticmethod
-    def load(path: str, logger: DistributedLogger, few_shot: bool) -> List[Dict]:
+    def load(path: str, logger: DistributedLogger, *args, **kwargs) -> List[Dict]:
         dataset = {"test": defaultdict(dict)}
 
         file_path = os.path.join(path, "question.jsonl")
@@ -56,9 +56,11 @@ class MTBenchDataset(BaseDataset):
                     "instruction": question["turns"],
                     "input": "",
                     "output": [],
-                    "target": [""] * turn_number
-                    if question["question_id"] not in reference
-                    else reference[question["question_id"]],
+                    "target": (
+                        [""] * turn_number
+                        if question["question_id"] not in reference
+                        else reference[question["question_id"]]
+                    ),
                 }
 
                 if category in dataset["test"]:

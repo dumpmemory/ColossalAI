@@ -1,3 +1,4 @@
+import warnings
 from functools import partial
 from typing import Callable, Dict, List
 
@@ -5,7 +6,7 @@ from torch import Tensor, nn
 
 import colossalai.shardformer.layer as col_nn
 
-from ..modeling.gpt2 import GPT2PipelineForwards, get_gpt2_flash_attention_forward, gpt2_sequence_parallel_forward_fn
+from ..modeling.gpt2 import GPT2PipelineForwards, get_gpt2_flash_attention_forward, get_jit_fused_gpt2_mlp_forward
 from .base_policy import ModulePolicyDescription, Policy, SubModuleReplacementDescription
 
 __all__ = [
@@ -27,32 +28,53 @@ class GPT2Policy(Policy):
         r"""
         Reshape the Embedding layer to make the embedding dimension divisible by world_size
         """
-        if self.shard_config.enable_tensor_parallelism:
-            vocab_size = self.model.config.vocab_size
-            world_size = self.shard_config.tensor_parallel_size
-            if vocab_size % world_size != 0:
-                new_vocab_size = vocab_size + world_size - vocab_size % world_size
-                self.model.resize_token_embeddings(new_vocab_size)
+        self.tie_weight = self.tie_weight_check()
+        self.origin_attn_implement = self.model.config._attn_implementation
+        self.enable_bias_gelu_fused = (
+            self.shard_config.enable_jit_fused and self.model.config.activation_function == "gelu"
+        )
         return self.model
 
     def module_policy(self):
-        from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, GPT2Block, GPT2Model
+        from transformers.models.gpt2.modeling_gpt2 import GPT2MLP, GPT2Attention, GPT2Block, GPT2Model
+
+        ATTN_IMPLEMENTATION = {
+            "eager": GPT2Attention,
+        }
 
         policy = {}
+
+        attn_cls = ATTN_IMPLEMENTATION[self.origin_attn_implement]
+
+        embedding_cls = None
+        if self.shard_config.enable_tensor_parallelism:
+            embedding_cls = col_nn.VocabParallelEmbedding1D
+        else:
+            if self.tie_weight:
+                embedding_cls = col_nn.PaddingEmbedding
 
         if self.shard_config.enable_fused_normalization:
             norm_cls = col_nn.FusedLayerNorm
         else:
             norm_cls = col_nn.LayerNorm
-        use_sequence_parallel = self.shard_config.enable_sequence_parallelism
-        overlap = self.shard_config.enable_sequence_overlap
+
+        sp_mode = self.shard_config.sequence_parallelism_mode or None
+        assert sp_mode != "all_to_all", "all_to_all sequence parallelism is not supported for GPT2"
+        if sp_mode == "ring":
+            warnings.warn(
+                f"For GPT2, sequence parallelism is currently not support mode {sp_mode}, will set to be split_gather"
+            )
+            self.shard_config.sequence_parallelism_mode = sp_mode = "split_gather"
+        sp_partial_derived = sp_mode in ["split_gather", "ring"]
+        use_flash_attention = self.shard_config.enable_flash_attention
+        use_zbv = self.pipeline_stage_manager is not None and self.pipeline_stage_manager.use_zbv
+
         if self.shard_config.enable_tensor_parallelism:
+            assert (
+                self.model.config.num_attention_heads % self.shard_config.tensor_parallel_size == 0
+            ), f"The number of attention heads must be divisible by tensor parallel size."
             policy[GPT2Model] = ModulePolicyDescription(
                 sub_module_replacement=[
-                    SubModuleReplacementDescription(
-                        suffix="wte",
-                        target_module=col_nn.VocabParallelEmbedding1D,
-                    ),
                     SubModuleReplacementDescription(
                         suffix="drop",
                         target_module=col_nn.DropoutForParallelInput,
@@ -70,25 +92,40 @@ class GPT2Policy(Policy):
                     SubModuleReplacementDescription(
                         suffix="attn.c_attn",
                         target_module=col_nn.GPT2FusedLinearConv1D_Col,
-                        kwargs={"n_fused": 3, "seq_parallel": use_sequence_parallel, "overlap": overlap},
+                        kwargs={
+                            "split_sizes": [self.model.config.hidden_size] * 3,
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="attn.c_proj",
                         target_module=col_nn.GPT2FusedLinearConv1D_Row,
                         kwargs={
-                            "seq_parallel": use_sequence_parallel,
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
                         },
                     ),
                     SubModuleReplacementDescription(
                         suffix="mlp.c_fc",
                         target_module=col_nn.GPT2FusedLinearConv1D_Col,
-                        kwargs={"n_fused": 1, "seq_parallel": use_sequence_parallel, "overlap": overlap},
+                        kwargs={
+                            "split_sizes": [self.model.config.n_inner or 4 * self.model.config.hidden_size],
+                            "seq_parallel_mode": sp_mode,
+                            "skip_bias_add": self.enable_bias_gelu_fused,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="mlp.c_proj",
                         target_module=col_nn.GPT2FusedLinearConv1D_Row,
                         kwargs={
-                            "seq_parallel": use_sequence_parallel,
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
                         },
                     ),
                     SubModuleReplacementDescription(
@@ -104,6 +141,104 @@ class GPT2Policy(Policy):
                         target_module=col_nn.DropoutForParallelInput,
                     ),
                 ],
+            )
+            if self.enable_bias_gelu_fused:
+                self.append_or_create_method_replacement(
+                    description={
+                        "forward": get_jit_fused_gpt2_mlp_forward(),
+                    },
+                    policy=policy,
+                    target_key=GPT2MLP,
+                )
+        elif use_zbv:
+            policy[GPT2Model] = ModulePolicyDescription(
+                sub_module_replacement=[
+                    SubModuleReplacementDescription(
+                        suffix="drop",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                ]
+            )
+
+            policy[GPT2Block] = ModulePolicyDescription(
+                sub_module_replacement=[
+                    SubModuleReplacementDescription(
+                        suffix="attn.c_attn",
+                        target_module=col_nn.GPT2FusedLinearConv,
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attn.c_proj",
+                        target_module=col_nn.GPT2FusedLinearConv,
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.c_fc",
+                        target_module=col_nn.GPT2FusedLinearConv,
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "skip_bias_add": self.enable_bias_gelu_fused,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.c_proj",
+                        target_module=col_nn.GPT2FusedLinearConv,
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attn.attn_dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attn.resid_dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                ],
+            )
+            if self.enable_bias_gelu_fused:
+                self.append_or_create_method_replacement(
+                    description={
+                        "forward": get_jit_fused_gpt2_mlp_forward(),
+                    },
+                    policy=policy,
+                    target_key=GPT2MLP,
+                )
+
+        if embedding_cls is not None:
+            # padding vocabulary size when using pp to make it divisible by  shard_config.make_vocab_size_divisible_by
+            self.append_or_create_submodule_replacement(
+                description=SubModuleReplacementDescription(
+                    suffix="wte",
+                    target_module=embedding_cls,
+                    kwargs=(
+                        {
+                            "make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                        }
+                        if self.shard_config.enable_tensor_parallelism
+                        else {"make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by}
+                    ),
+                ),
+                policy=policy,
+                target_key=GPT2Model,
             )
 
         # optimization configuration
@@ -121,35 +256,37 @@ class GPT2Policy(Policy):
                 SubModuleReplacementDescription(
                     suffix="ln_1",
                     target_module=norm_cls,
-                    kwargs={"sp_partial_derived": use_sequence_parallel},
+                    kwargs={"sp_partial_derived": sp_partial_derived},
                 ),
                 SubModuleReplacementDescription(
                     suffix="ln_2",
                     target_module=norm_cls,
-                    kwargs={"sp_partial_derived": use_sequence_parallel},
+                    kwargs={"sp_partial_derived": sp_partial_derived},
                 ),
                 SubModuleReplacementDescription(
                     suffix="ln_cross_attn",
                     target_module=norm_cls,
                     ignore_if_not_exist=True,
-                    kwargs={"sp_partial_derived": use_sequence_parallel},
+                    kwargs={"sp_partial_derived": sp_partial_derived},
                 ),
             ],
             policy=policy,
             target_key=GPT2Block,
         )
 
-        if self.shard_config.enable_flash_attention:
+        if use_flash_attention:
             self.append_or_create_method_replacement(
                 description={
-                    "forward": get_gpt2_flash_attention_forward(),
+                    "forward": get_gpt2_flash_attention_forward(shard_config=self.shard_config),
                 },
                 policy=policy,
-                target_key=GPT2Attention,
+                target_key=attn_cls,
             )
 
-        if self.shard_config.enable_sequence_parallelism:
-            policy[GPT2Model].method_replacement = {"forward": gpt2_sequence_parallel_forward_fn(self.shard_config)}
+        if not self.shard_config.pipeline_stage_manager and self.shard_config.enable_sequence_parallelism:
+            policy[GPT2Model].method_replacement = {
+                "forward": partial(GPT2PipelineForwards.gpt2_model_forward, shard_config=self.shard_config)
+            }
 
         return policy
 
@@ -167,15 +304,28 @@ class GPT2Policy(Policy):
         stage_manager = self.pipeline_stage_manager
 
         held_layers = []
-        layers_per_stage = self.distribute_layers(len(module.h), stage_manager.num_stages)
-        if stage_manager.is_first_stage():
-            held_layers.append(module.wte)
-            held_layers.append(module.wpe)
-            held_layers.append(module.drop)
-        start_idx, end_idx = self.get_stage_index(layers_per_stage, stage_manager.stage)
-        held_layers.extend(module.h[start_idx:end_idx])
-        if stage_manager.is_last_stage():
-            held_layers.append(module.ln_f)
+        if stage_manager.is_interleave:
+            assert stage_manager.num_model_chunks is not None
+            layers_per_stage = stage_manager.distribute_layers(len(module.h))
+            stage_indices = stage_manager.get_stage_index(layers_per_stage)
+            if stage_manager.is_first_stage(ignore_chunk=True):
+                held_layers.append(module.wte)
+                held_layers.append(module.wpe)
+                held_layers.append(module.drop)
+            for start_idx, end_idx in stage_indices:
+                held_layers.extend(module.h[start_idx:end_idx])
+            if stage_manager.is_last_stage(ignore_chunk=True):
+                held_layers.append(module.ln_f)
+        else:
+            layers_per_stage = stage_manager.distribute_layers(len(module.h))
+            if stage_manager.is_first_stage():
+                held_layers.append(module.wte)
+                held_layers.append(module.wpe)
+                held_layers.append(module.drop)
+            start_idx, end_idx = stage_manager.get_stage_index(layers_per_stage)
+            held_layers.extend(module.h[start_idx:end_idx])
+            if stage_manager.is_last_stage():
+                held_layers.append(module.ln_f)
         return held_layers
 
     def set_pipeline_forward(self, model_cls: nn.Module, new_forward: Callable, policy: Dict) -> None:
@@ -189,13 +339,27 @@ class GPT2Policy(Policy):
         else:
             module = self.model.transformer
 
-        layers_per_stage = Policy.distribute_layers(len(module.h), stage_manager.num_stages)
-        stage_index = Policy.get_stage_index(layers_per_stage, stage_manager.stage)
-        method_replacement = {
-            "forward": partial(
-                new_forward, stage_manager=stage_manager, stage_index=stage_index, shard_config=self.shard_config
-            )
-        }
+        if stage_manager.is_interleave:
+            layers_per_stage = stage_manager.distribute_layers(len(module.h))
+            stage_manager.stage_indices = stage_manager.get_stage_index(layers_per_stage)
+            method_replacement = {
+                "forward": partial(
+                    new_forward,
+                    stage_manager=stage_manager,
+                    shard_config=self.shard_config,
+                )
+            }
+        else:
+            layers_per_stage = stage_manager.distribute_layers(len(module.h))
+            stage_index = stage_manager.get_stage_index(layers_per_stage)
+            method_replacement = {
+                "forward": partial(
+                    new_forward,
+                    stage_manager=stage_manager,
+                    stage_index=stage_index,
+                    shard_config=self.shard_config,
+                )
+            }
         self.append_or_create_method_replacement(description=method_replacement, policy=policy, target_key=model_cls)
 
 
@@ -208,7 +372,9 @@ class GPT2ModelPolicy(GPT2Policy):
 
         if self.pipeline_stage_manager is not None:
             self.set_pipeline_forward(
-                model_cls=GPT2Model, new_forward=GPT2PipelineForwards.gpt2_model_forward, policy=policy
+                model_cls=GPT2Model,
+                new_forward=GPT2PipelineForwards.gpt2_model_forward,
+                policy=policy,
             )
         return policy
 
@@ -226,18 +392,39 @@ class GPT2LMHeadModelPolicy(GPT2Policy):
         from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 
         module_policy = super().module_policy()
-
+        module_policy[GPT2LMHeadModel] = ModulePolicyDescription()
         if self.shard_config.enable_tensor_parallelism:
-            addon_module = {
-                GPT2LMHeadModel: ModulePolicyDescription(
-                    sub_module_replacement=[
-                        SubModuleReplacementDescription(
-                            suffix="lm_head", target_module=col_nn.Linear1D_Col, kwargs={"gather_output": True}
-                        )
-                    ]
-                )
-            }
-            module_policy.update(addon_module)
+            self.append_or_create_submodule_replacement(
+                description=SubModuleReplacementDescription(
+                    suffix="lm_head",
+                    target_module=col_nn.VocabParallelLMHead1D,
+                    kwargs={
+                        "gather_output": False,
+                        "make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by,
+                    },
+                ),
+                policy=module_policy,
+                target_key=GPT2LMHeadModel,
+            )
+        else:
+            self.append_or_create_submodule_replacement(
+                description=SubModuleReplacementDescription(
+                    suffix="lm_head",
+                    target_module=col_nn.PaddingLMHead,
+                    kwargs={"make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by},
+                ),
+                policy=module_policy,
+                target_key=GPT2LMHeadModel,
+            )
+
+        if self.shard_config.parallel_output:
+            self.append_or_create_method_replacement(
+                description={
+                    "forward": partial(GPT2PipelineForwards.gpt2_lmhead_model_forward, shard_config=self.shard_config)
+                },
+                policy=module_policy,
+                target_key=GPT2LMHeadModel,
+            )
 
         if self.pipeline_stage_manager is not None:
             self.set_pipeline_forward(
@@ -249,8 +436,17 @@ class GPT2LMHeadModelPolicy(GPT2Policy):
 
     def get_held_layers(self) -> List[nn.Module]:
         held_layers = super().get_held_layers()
-        if self.pipeline_stage_manager.is_last_stage():
-            held_layers.append(self.model.lm_head)
+        stage_manager = self.pipeline_stage_manager
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.lm_head)
+        else:
+            if self.pipeline_stage_manager.is_last_stage(ignore_chunk=True):
+                held_layers.append(self.model.lm_head)
+        # if self.pipeline_stage_manager.is_last_stage(ignore_chunk=True):
+        #     held_layers.append(self.model.lm_head)
         return held_layers
 
     def get_shared_params(self) -> List[Dict[int, Tensor]]:
@@ -260,7 +456,12 @@ class GPT2LMHeadModelPolicy(GPT2Policy):
         if stage_manager is not None:
             if stage_manager.num_stages > 1 and id(module.transformer.wte.weight) == id(module.lm_head.weight):
                 first_stage, last_stage = 0, stage_manager.num_stages - 1
-                return [{first_stage: module.transformer.wte.weight, last_stage: module.lm_head.weight}]
+                return [
+                    {
+                        first_stage: module.transformer.wte.weight,
+                        last_stage: module.lm_head.weight,
+                    }
+                ]
         return []
 
 
@@ -276,12 +477,30 @@ class GPT2DoubleHeadsModelPolicy(GPT2Policy):
                 GPT2DoubleHeadsModel: ModulePolicyDescription(
                     sub_module_replacement=[
                         SubModuleReplacementDescription(
-                            suffix="lm_head", target_module=col_nn.Linear1D_Col, kwargs={"gather_output": True}
+                            suffix="lm_head",
+                            target_module=col_nn.VocabParallelLMHead1D,
+                            kwargs={
+                                "gather_output": True,
+                                "make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by,
+                                "fp8_communication": self.shard_config.fp8_communication,
+                            },
                         )
                     ]
                 )
             }
-            module_policy.update(addon_module)
+        else:
+            addon_module = {
+                GPT2DoubleHeadsModel: ModulePolicyDescription(
+                    sub_module_replacement=[
+                        SubModuleReplacementDescription(
+                            suffix="lm_head",
+                            target_module=col_nn.PaddingLMHead,
+                            kwargs={"make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by},
+                        )
+                    ]
+                )
+            }
+        module_policy.update(addon_module)
 
         if self.pipeline_stage_manager is not None:
             self.set_pipeline_forward(
@@ -294,13 +513,24 @@ class GPT2DoubleHeadsModelPolicy(GPT2Policy):
 
     def get_held_layers(self) -> List[nn.Module]:
         held_layers = super().get_held_layers()
-        if self.pipeline_stage_manager.is_last_stage():
-            multiple_choice_head = self.model.multiple_choice_head
-            held_layers.append(self.model.lm_head)
-            held_layers.append(multiple_choice_head.summary)
-            held_layers.append(multiple_choice_head.activation)
-            held_layers.append(multiple_choice_head.first_dropout)
-            held_layers.append(multiple_choice_head.last_dropout)
+        stage_manager = self.pipeline_stage_manager
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.lm_head)
+                held_layers.append(multiple_choice_head.summary)
+                held_layers.append(multiple_choice_head.activation)
+                held_layers.append(multiple_choice_head.first_dropout)
+                held_layers.append(multiple_choice_head.last_dropout)
+        else:
+            if self.pipeline_stage_manager.is_last_stage():
+                multiple_choice_head = self.model.multiple_choice_head
+                held_layers.append(self.model.lm_head)
+                held_layers.append(multiple_choice_head.summary)
+                held_layers.append(multiple_choice_head.activation)
+                held_layers.append(multiple_choice_head.first_dropout)
+                held_layers.append(multiple_choice_head.last_dropout)
 
         return held_layers
 
@@ -311,7 +541,12 @@ class GPT2DoubleHeadsModelPolicy(GPT2Policy):
         if stage_manager is not None:
             if stage_manager.num_stages > 1 and id(module.transformer.wte.weight) == id(module.lm_head.weight):
                 first_stage, last_stage = 0, stage_manager.num_stages - 1
-                return [{first_stage: module.transformer.wte.weight, last_stage: module.lm_head.weight}]
+                return [
+                    {
+                        first_stage: module.transformer.wte.weight,
+                        last_stage: module.lm_head.weight,
+                    }
+                ]
         return []
 
 
@@ -333,8 +568,17 @@ class GPT2ForQuestionAnsweringPolicy(GPT2Policy):
 
     def get_held_layers(self) -> List[nn.Module]:
         held_layers = super().get_held_layers()
-        if self.pipeline_stage_manager.is_last_stage():
-            held_layers.append(self.model.qa_outputs)
+        stage_manager = self.pipeline_stage_manager
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.qa_outputs)
+        else:
+            if self.pipeline_stage_manager.is_last_stage():
+                held_layers.append(self.model.qa_outputs)
+        # if self.pipeline_stage_manager.is_last_stage():
+        #     held_layers.append(self.model.qa_outputs)
         return held_layers
 
     def get_shared_params(self) -> List[Dict[int, Tensor]]:
@@ -353,7 +597,10 @@ class GPT2ForTokenClassificationPolicy(GPT2Policy):
             addon_module = {
                 GPT2ForTokenClassification: ModulePolicyDescription(
                     sub_module_replacement=[
-                        SubModuleReplacementDescription(suffix="dropout", target_module=col_nn.DropoutForParallelInput)
+                        SubModuleReplacementDescription(
+                            suffix="dropout",
+                            target_module=col_nn.DropoutForParallelInput,
+                        )
                     ]
                 )
             }
@@ -369,9 +616,20 @@ class GPT2ForTokenClassificationPolicy(GPT2Policy):
 
     def get_held_layers(self) -> List[nn.Module]:
         held_layers = super().get_held_layers()
-        if self.pipeline_stage_manager.is_last_stage():
-            held_layers.append(self.model.dropout)
-            held_layers.append(self.model.classifier)
+        stage_manager = self.pipeline_stage_manager
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.dropout)
+                held_layers.append(self.model.classifier)
+        else:
+            if self.pipeline_stage_manager.is_last_stage():
+                held_layers.append(self.model.dropout)
+                held_layers.append(self.model.classifier)
+        # if self.pipeline_stage_manager.is_last_stage():
+        #     held_layers.append(self.model.dropout)
+        #     held_layers.append(self.model.classifier)
         return held_layers
 
     def get_shared_params(self) -> List[Dict[int, Tensor]]:
@@ -396,8 +654,18 @@ class GPT2ForSequenceClassificationPolicy(GPT2Policy):
 
     def get_held_layers(self) -> List[nn.Module]:
         held_layers = super().get_held_layers()
-        if self.pipeline_stage_manager.is_last_stage():
-            held_layers.append(self.model.score)
+        stage_manager = self.pipeline_stage_manager
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.score)
+        else:
+            if self.pipeline_stage_manager.is_last_stage():
+                held_layers.append(self.model.score)
+
+        # if self.pipeline_stage_manager.is_last_stage():
+        #     held_layers.append(self.model.score)
         return held_layers
 
     def get_shared_params(self) -> List[Dict[int, Tensor]]:

@@ -6,7 +6,11 @@ from torch import Tensor, nn
 
 import colossalai.shardformer.layer as col_nn
 
-from ..modeling.gptj import GPTJPipelineForwards, get_gptj_flash_attention_forward
+from ..modeling.gptj import (
+    GPTJPipelineForwards,
+    get_gptj_flash_attention_forward,
+    gptj_model_forward_for_flash_attention,
+)
 from .base_policy import ModulePolicyDescription, Policy, SubModuleReplacementDescription
 
 __all__ = [
@@ -25,35 +29,36 @@ class GPTJPolicy(Policy):
         pass
 
     def preprocess(self):
-        # reshape the embedding layer
-        r"""
-        Reshape the Embedding layer to make the embedding dimension divisible by world_size
-        """
-        if self.shard_config.enable_tensor_parallelism:
-            vocab_size = self.model.config.vocab_size
-            world_size = self.shard_config.tensor_parallel_size
-            if vocab_size % world_size != 0:
-                new_vocab_size = vocab_size + world_size - vocab_size % world_size
-                self.model.resize_token_embeddings(new_vocab_size)
+        self.tie_weight = self.tie_weight_check()
+        self.origin_attn_implement = self.model.config._attn_implementation
         return self.model
 
     def module_policy(self):
-        from transformers.models.gptj.modeling_gptj import GPTJAttention, GPTJBlock, GPTJModel
+        from transformers.models.gptj.modeling_gptj import GPTJ_ATTENTION_CLASSES, GPTJBlock, GPTJModel
 
         policy = {}
+
+        attn_cls = GPTJ_ATTENTION_CLASSES[self.origin_attn_implement]
+
+        embedding_cls = None
+        if self.shard_config.enable_tensor_parallelism:
+            embedding_cls = col_nn.VocabParallelEmbedding1D
+        else:
+            if self.tie_weight:
+                embedding_cls = col_nn.PaddingEmbedding
+
         if self.shard_config.enable_sequence_parallelism:
             self.shard_config.enable_sequence_parallelism = False
             warnings.warn("GPTJ doesn't support sequence parallelism now, will ignore the sequence parallelism flag.")
-        use_sequence_parallel = self.shard_config.enable_sequence_parallelism
 
-        overlap = self.shard_config.enable_sequence_overlap
+        use_zbv = self.pipeline_stage_manager is not None and self.pipeline_stage_manager.use_zbv
+
         if self.shard_config.enable_tensor_parallelism:
+            assert (
+                self.model.config.num_attention_heads % self.shard_config.tensor_parallel_size == 0
+            ), f"The number of attention heads must be divisible by tensor parallel size."
             policy[GPTJModel] = ModulePolicyDescription(
                 sub_module_replacement=[
-                    SubModuleReplacementDescription(
-                        suffix="wte",
-                        target_module=col_nn.VocabParallelEmbedding1D,
-                    ),
                     SubModuleReplacementDescription(
                         suffix="drop",
                         target_module=col_nn.DropoutForParallelInput,
@@ -71,32 +76,50 @@ class GPTJPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="attn.k_proj",
                         target_module=col_nn.Linear1D_Col,
-                        kwargs={"seq_parallel": use_sequence_parallel, "overlap": overlap},
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="attn.q_proj",
                         target_module=col_nn.Linear1D_Col,
-                        kwargs={"seq_parallel": use_sequence_parallel, "overlap": overlap},
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="attn.v_proj",
                         target_module=col_nn.Linear1D_Col,
-                        kwargs={"seq_parallel": use_sequence_parallel, "overlap": overlap},
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="attn.out_proj",
                         target_module=col_nn.Linear1D_Row,
-                        kwargs={"seq_parallel": use_sequence_parallel},
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="mlp.fc_in",
                         target_module=col_nn.Linear1D_Col,
-                        kwargs={"seq_parallel": use_sequence_parallel},
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="mlp.fc_out",
                         target_module=col_nn.Linear1D_Row,
-                        kwargs={"seq_parallel": use_sequence_parallel},
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="attn.attn_dropout",
@@ -111,6 +134,88 @@ class GPTJPolicy(Policy):
                         target_module=col_nn.DropoutForParallelInput,
                     ),
                 ],
+            )
+        elif use_zbv:
+            policy[GPTJBlock] = ModulePolicyDescription(
+                sub_module_replacement=[
+                    SubModuleReplacementDescription(
+                        suffix="attn.k_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attn.q_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attn.v_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attn.out_proj",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.fc_in",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.fc_out",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attn.attn_dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attn.resid_dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="mlp.dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                ],
+            )
+        if embedding_cls is not None:
+            self.append_or_create_submodule_replacement(
+                description=SubModuleReplacementDescription(
+                    suffix="wte",
+                    target_module=embedding_cls,
+                    kwargs=(
+                        {
+                            "make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                        }
+                        if self.shard_config.enable_tensor_parallelism
+                        else {"make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by}
+                    ),
+                ),
+                policy=policy,
+                target_key=GPTJModel,
             )
 
         # optimization configuration
@@ -141,8 +246,14 @@ class GPTJPolicy(Policy):
                     "forward": get_gptj_flash_attention_forward(),
                 },
                 policy=policy,
-                target_key=GPTJAttention,
+                target_key=attn_cls,
             )
+            if not self.shard_config.pipeline_stage_manager:
+                self.append_or_create_method_replacement(
+                    description={"forward": gptj_model_forward_for_flash_attention(self.shard_config)},
+                    policy=policy,
+                    target_key=GPTJModel,
+                )
 
         return policy
 
@@ -160,14 +271,26 @@ class GPTJPolicy(Policy):
         stage_manager = self.pipeline_stage_manager
 
         held_layers = []
-        layers_per_stage = self.distribute_layers(len(module.h), stage_manager.num_stages)
-        if stage_manager.is_first_stage():
-            held_layers.append(module.wte)
-            held_layers.append(module.drop)
-        start_idx, end_idx = self.get_stage_index(layers_per_stage, stage_manager.stage)
-        held_layers.extend(module.h[start_idx:end_idx])
-        if stage_manager.is_last_stage():
-            held_layers.append(module.ln_f)
+        layers_per_stage = stage_manager.distribute_layers(len(module.h))
+        if stage_manager.is_interleave:
+            if stage_manager.is_first_stage(ignore_chunk=True):
+                held_layers.append(module.wte)
+                held_layers.append(module.drop)
+            stage_indices = stage_manager.get_stage_index(layers_per_stage)
+            for start_idx, end_idx in stage_indices:
+                held_layers.extend(module.h[start_idx:end_idx])
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(module.ln_f)
+        else:
+            if stage_manager.is_first_stage():
+                held_layers.append(module.wte)
+                held_layers.append(module.drop)
+            start_idx, end_idx = stage_manager.get_stage_index(layers_per_stage)
+            held_layers.extend(module.h[start_idx:end_idx])
+            if stage_manager.is_last_stage():
+                held_layers.append(module.ln_f)
         return held_layers
 
     def set_pipeline_forward(self, model_cls: nn.Module, new_forward: Callable, policy: Dict) -> None:
@@ -181,11 +304,14 @@ class GPTJPolicy(Policy):
         else:
             module = self.model.transformer
 
-        layers_per_stage = Policy.distribute_layers(len(module.h), stage_manager.num_stages)
-        stage_index = Policy.get_stage_index(layers_per_stage, stage_manager.stage)
+        layers_per_stage = stage_manager.distribute_layers(len(module.h))
+        stage_index = stage_manager.get_stage_index(layers_per_stage)
         method_replacement = {
             "forward": partial(
-                new_forward, stage_manager=stage_manager, stage_index=stage_index, shard_config=self.shard_config
+                new_forward,
+                stage_manager=stage_manager,
+                stage_index=stage_index,
+                shard_config=self.shard_config,
             )
         }
         self.append_or_create_method_replacement(description=method_replacement, policy=policy, target_key=model_cls)
@@ -203,7 +329,9 @@ class GPTJModelPolicy(GPTJPolicy):
 
         if self.pipeline_stage_manager is not None:
             self.set_pipeline_forward(
-                model_cls=GPTJModel, new_forward=GPTJPipelineForwards.gptj_model_forward, policy=policy
+                model_cls=GPTJModel,
+                new_forward=GPTJPipelineForwards.gptj_model_forward,
+                policy=policy,
             )
         return policy
 
@@ -230,23 +358,50 @@ class GPTJForCausalLMPolicy(GPTJPolicy):
                 GPTJForCausalLM: ModulePolicyDescription(
                     sub_module_replacement=[
                         SubModuleReplacementDescription(
-                            suffix="lm_head", target_module=col_nn.Linear1D_Col, kwargs={"gather_output": True}
+                            suffix="lm_head",
+                            target_module=col_nn.VocabParallelLMHead1D,
+                            kwargs={
+                                "gather_output": True,
+                                "make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by,
+                                "fp8_communication": self.shard_config.fp8_communication,
+                            },
                         )
                     ]
                 )
             }
-            policy.update(addon_module)
+        else:
+            addon_module = {
+                GPTJForCausalLM: ModulePolicyDescription(
+                    sub_module_replacement=[
+                        SubModuleReplacementDescription(
+                            suffix="lm_head",
+                            target_module=col_nn.PaddingLMHead,
+                            kwargs={"make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by},
+                        )
+                    ]
+                )
+            }
+        policy.update(addon_module)
 
         if self.pipeline_stage_manager is not None:
             self.set_pipeline_forward(
-                model_cls=GPTJForCausalLM, new_forward=GPTJPipelineForwards.gptj_causallm_model_forward, policy=policy
+                model_cls=GPTJForCausalLM,
+                new_forward=GPTJPipelineForwards.gptj_causallm_model_forward,
+                policy=policy,
             )
         return policy
 
     def get_held_layers(self) -> List[nn.Module]:
         held_layers = super().get_held_layers()
-        if self.pipeline_stage_manager.is_last_stage():
-            held_layers.append(self.model.lm_head)
+        stage_manager = self.pipeline_stage_manager
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.lm_head)
+        else:
+            if self.pipeline_stage_manager.is_last_stage():
+                held_layers.append(self.model.lm_head)
         return held_layers
 
     def get_shared_params(self) -> List[Dict[int, Tensor]]:
@@ -256,7 +411,12 @@ class GPTJForCausalLMPolicy(GPTJPolicy):
         if stage_manager is not None:
             if stage_manager.num_stages > 1 and id(module.transformer.wte.weight) == id(module.lm_head.weight):
                 first_stage, last_stage = 0, stage_manager.num_stages - 1
-                return [{first_stage: module.transformer.wte.weight, last_stage: module.lm_head.weight}]
+                return [
+                    {
+                        first_stage: module.transformer.wte.weight,
+                        last_stage: module.lm_head.weight,
+                    }
+                ]
         return []
 
 
@@ -280,8 +440,15 @@ class GPTJForSequenceClassificationPolicy(GPTJPolicy):
 
     def get_held_layers(self) -> List[nn.Module]:
         held_layers = super().get_held_layers()
-        if self.pipeline_stage_manager.is_last_stage():
-            held_layers.append(self.model.score)
+        stage_manager = self.pipeline_stage_manager
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.score)
+        else:
+            if self.pipeline_stage_manager.is_last_stage():
+                held_layers.append(self.model.score)
         return held_layers
 
     def get_shared_params(self) -> List[Dict[int, Tensor]]:
@@ -309,8 +476,15 @@ class GPTJForQuestionAnsweringPolicy(GPTJPolicy):
 
     def get_held_layers(self) -> List[nn.Module]:
         held_layers = super().get_held_layers()
-        if self.pipeline_stage_manager.is_last_stage():
-            held_layers.append(self.model.qa_outputs)
+        stage_manager = self.pipeline_stage_manager
+        if stage_manager.is_interleave:
+            if (stage_manager.use_zbv and stage_manager.is_first_stage(ignore_chunk=True)) or (
+                not stage_manager.use_zbv and stage_manager.is_last_stage(ignore_chunk=True)
+            ):
+                held_layers.append(self.model.qa_outputs)
+        else:
+            if self.pipeline_stage_manager.is_last_stage():
+                held_layers.append(self.model.qa_outputs)
         return held_layers
 
     def get_shared_params(self) -> List[Dict[int, Tensor]]:

@@ -7,11 +7,12 @@ from colossalai.tensor.param_op_hook import ColoParamOpHookManager
 
 from .colo_tensor import _convert_output
 
-WHITE_LIST_FUNCS = {torch.Tensor.__getitem__, torch.Tensor.is_floating_point}
+WHITE_LIST_FUNCS = {torch.Tensor.__getitem__}
+NO_HOOK_FUNCS = {torch.Tensor.is_floating_point}
 
 
 def is_no_hook_op(func) -> bool:
-    return func.__name__.startswith("__") and func not in WHITE_LIST_FUNCS
+    return (func.__name__.startswith("__") and func not in WHITE_LIST_FUNCS) or func in NO_HOOK_FUNCS
 
 
 def filter_colo_parameters(*args, **kwargs):
@@ -60,6 +61,8 @@ class ColoParameter(ColoTensor, torch.nn.Parameter):
                 with torch._C.DisableTorchFunction():
                     new_args = ColoParamOpHookManager.pre_op(params, *args, *kwargs.values())
                 args, kwargs = replace_args(args, kwargs, new_args)
+                with torch._C.DisableTorchFunction():
+                    func = ColoParamOpHookManager.rewrite_op(func)
                 ret = super().__torch_function__(func, types, args, kwargs)
                 with torch._C.DisableTorchFunction():
                     ret = ColoParamOpHookManager.post_op(params, ret)

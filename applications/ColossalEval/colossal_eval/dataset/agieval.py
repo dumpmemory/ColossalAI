@@ -47,7 +47,7 @@ default_inference_kwargs = {
     "calculate_loss": True,
     "all_classes": None,
     "language": "Chinese",
-    "pretrain": False,
+    "calculate_overall_loss": False,
     "max_new_tokens": 32,
 }
 
@@ -78,7 +78,9 @@ def get_prompt(line: Dict, dataset_name: str, logger: DistributedLogger) -> Dict
             option_string = "ABCDEFG"
             count = len(line["options"])
 
-            input = "问题：" + line["question"] + " " + "从以下选项中选择：" + " ".join(line["options"]) + "\n" + "答案："
+            input = (
+                "问题：" + line["question"] + " " + "从以下选项中选择：" + " ".join(line["options"]) + "\n" + "答案："
+            )
 
             all_classes = list(option_string[0:count])
 
@@ -150,7 +152,15 @@ def combine_prompt(prompt_path, dataset_name, load_explanation=True, chat_mode=F
             )
         elif dataset_name in chinese_qa_datasets:
             question_input = (
-                "问题：" + passage + " " + question + "\n" + "从以下选项中选择：" + " ".join(options) + "\n" + "答案：{}".format(label)
+                "问题："
+                + passage
+                + " "
+                + question
+                + "\n"
+                + "从以下选项中选择："
+                + " ".join(options)
+                + "\n"
+                + "答案：{}".format(label)
             )
         elif dataset_name in english_cloze_datasets:
             question_input = "Question: ".format(idx + 1) + question + "\n" + "Answer: {}".format(answer)
@@ -187,9 +197,7 @@ class AGIEvalDataset(BaseDataset):
     """
 
     @staticmethod
-    def load(
-        path: str, logger: DistributedLogger, few_shot: bool, forward_only: bool, load_train: bool, load_reference: bool
-    ) -> List[Dict]:
+    def load(path: str, logger: DistributedLogger, few_shot: bool, *args, **kwargs) -> List[Dict]:
         dataset = {"test": {}}
 
         files = glob.glob(os.path.join(path, "*.jsonl"))
@@ -201,7 +209,7 @@ class AGIEvalDataset(BaseDataset):
         for file in files:
             dataset_name = os.path.basename(file)[0 : -len(".jsonl")]
 
-            few_shot_data = []
+            few_shot_data = None
             if few_shot:
                 # process demo once if it is few-shot-CoT
                 few_shot_data = combine_prompt(prompt_path, dataset_name, load_explanation=False, chat_mode=False)

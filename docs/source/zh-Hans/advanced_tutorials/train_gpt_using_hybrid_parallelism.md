@@ -43,7 +43,6 @@ from colossalai.booster import Booster
 from colossalai.booster.plugin import GeminiPlugin, HybridParallelPlugin, LowLevelZeroPlugin, TorchDDPPlugin
 from colossalai.cluster import DistCoordinator
 from colossalai.nn.optimizer import HybridAdam
-from colossalai.utils import get_current_device
 ```
 ### 定义plugin
 定义一个[`HybridParallelPlugin`](../basics/booster_plugins.md)对象，指定所需要使用的并行策略，在该例子中，同时使用了流水线并行和zero1.
@@ -63,7 +62,7 @@ plugin = HybridParallelPlugin(
 ## 创建分布式环境.
 ```python
 # Launch ColossalAI
-colossalai.launch_from_torch(config={}, seed=42)
+colossalai.launch_from_torch(seed=42)
 coordinator = DistCoordinator()
 ```
 ## 定义GPT-2模型的训练组件
@@ -176,7 +175,7 @@ def train_epoch(
         for _ in pbar:
             if use_pipeline:
                 outputs = booster.execute_pipeline(
-                    train_dataloader_iter, model, _criterion, optimizer, return_loss=True, return_outputs=True
+                    train_dataloader_iter, model, _criterion, optimizer, return_loss=True
                 )
                 # Backward and optimize
                 if is_pp_last_stage:

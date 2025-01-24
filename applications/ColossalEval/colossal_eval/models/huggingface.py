@@ -1,16 +1,17 @@
 import copy
-import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from colossal_eval.utils import Conversation, get_batch_prompt, is_rank_0
 from peft import PeftModel
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from colossalai.logging import DistributedLogger
 from colossalai.shardformer import ShardConfig, ShardFormer
+from colossalai.utils import get_current_device
 
 from .base import BaseModel
 
@@ -76,7 +77,9 @@ class HuggingFaceModel(BaseModel):
             self.indices_for_choices[0].append(
                 self.tokenizer(f"Answer: {choice}", add_special_tokens=False).input_ids[-1]
             )
-            self.indices_for_choices[1].append(self.tokenizer(f"答案：{choice}", add_special_tokens=False).input_ids[-1])
+            self.indices_for_choices[1].append(
+                self.tokenizer(f"答案：{choice}", add_special_tokens=False).input_ids[-1]
+            )
 
     def _load_tokenizer(self, path: str, tokenizer_path: Optional[str], tokenizer_kwargs: dict):
         """
@@ -102,6 +105,12 @@ class HuggingFaceModel(BaseModel):
             elif hasattr(self.tokenizer, "eod_id"):
                 # Qwen has an eod token "<|endoftext|>".
                 self.tokenizer.pad_token_id = self.tokenizer.eod_id
+            else:
+                self.logger.error("Neither eos_token nor eod_id is available for setting pad_token_id.")
+                raise ValueError(
+                    "The tokenizer does not have a pad_token_id, eos_token, or eod_id. "
+                    "Please set pad_token_id manually."
+                )
 
     def _load_model(
         self, path: str, model_kwargs: dict, peft_path: Optional[str] = None, shard_config: ShardConfig = None
@@ -127,13 +136,13 @@ class HuggingFaceModel(BaseModel):
         if shard_config is not None:
             self.model = AutoModel.from_pretrained(path, **model_kwargs)
             shard_former = ShardFormer(shard_config)
-            self.model, sharded_parameters = shard_former.optimize(self.model)
-            self.model.to(torch.cuda.current_device())
+            self.model, _ = shard_former.optimize(self.model)
+            self.model.to(get_current_device())
 
             if peft_path is not None:
                 raise NotImplementedError("ShardFormer for PEFT models is not implemented.")
         else:
-            self.model = AutoModel.from_pretrained(path, **model_kwargs).to(torch.cuda.current_device())
+            self.model = AutoModel.from_pretrained(path, **model_kwargs).to(get_current_device())
             if peft_path is not None:
                 self.model = PeftModel.from_pretrained(self.model, peft_path, is_trainable=False)
         self.model.eval()
@@ -155,11 +164,11 @@ class HuggingFaceModel(BaseModel):
         """
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
-        ).to(torch.cuda.current_device())
+        ).to(get_current_device())
         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX).to(
-            torch.cuda.current_device()
+            get_current_device()
         )
-        attention_mask = input_ids.ne(self.tokenizer.pad_token_id).to(torch.cuda.current_device())
+        attention_mask = input_ids.ne(self.tokenizer.pad_token_id).to(get_current_device())
 
         outputs = self.model(input_ids, attention_mask=attention_mask)[0]
 
@@ -242,7 +251,7 @@ class HuggingFaceModel(BaseModel):
         return input_ids_list, labels_list, bytes_list
 
     def _get_input_ids_and_labels(
-        self, batch_prompt: List[str], batch_target: List[List[str]], pretrain: bool
+        self, batch_prompt: List[str], batch_target: List[List[str]], calculate_overall_loss: bool
     ) -> Tuple[List[torch.LongTensor]]:
         """
         Get input_ids and labels for the given data.
@@ -255,7 +264,7 @@ class HuggingFaceModel(BaseModel):
             Input_ids and labels for the given batch.
 
         """
-        if pretrain:
+        if calculate_overall_loss:
             batch = []
             # Concatenate prompt and target answers.
             # You should decide the concatenation character in the corresponding dataset script in dataset folder. For example, in line 119 dataset/gsm.py, the concatenation character is space.
@@ -322,7 +331,7 @@ class HuggingFaceModel(BaseModel):
 
         return input_ids_list, labels_list, None
 
-    def inference(self, data: List[Dict], inference_kwargs: Dict[str, Any], debug: bool = False) -> List[Dict]:
+    def inference(self, data_loader: DataLoader, inference_kwargs: Dict[str, Any], debug: bool = False) -> List[Dict]:
         """
         Infer the given data.
         This function will call self.generate() to get model outputs and also self.model() to get logits.
@@ -339,7 +348,7 @@ class HuggingFaceModel(BaseModel):
         calculate_loss = inference_kwargs["calculate_loss"]
         classes = inference_kwargs["all_classes"]
         language = inference_kwargs["language"]
-        pretrain = inference_kwargs["pretrain"]
+        calculate_overall_loss = inference_kwargs["calculate_overall_loss"]
         max_new_tokens = inference_kwargs["max_new_tokens"]
         few_shot_data = inference_kwargs.get("few_shot_data", None)
 
@@ -356,26 +365,23 @@ class HuggingFaceModel(BaseModel):
 
             self.str_label_map = {choice: idx for idx, choice in enumerate(self.choices)}
 
-        turn = 0 if not isinstance(data[0]["output"], list) else len(data[0]["output"]) + 1
-        turn_desc = "" if turn == 0 else f"-turn{turn}"
-
         bar = tqdm(
-            range(math.ceil(len(data) / self.batch_size)),
-            desc=f"{data[0]['dataset']}-{data[0]['category']}{turn_desc} Inference steps",
+            range(len(data_loader)),
+            desc=f"{inference_kwargs['dataset']}-{inference_kwargs['category']} Inference steps",
             disable=not is_rank_0(),
         )
         loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
 
-        answers = copy.deepcopy(data)
-        for i in range(0, len(data), self.batch_size):
-            batch = data[i : i + self.batch_size]
+        answers = []
+
+        for i, batch in enumerate(data_loader):
             batch_prompt, batch_target = get_batch_prompt(
-                self.prompt_template, batch, few_shot_data, self.tokenizer, language, self.model_max_length
+                self.prompt_template, batch, few_shot_data, self.tokenizer, self.model_max_length
             )
 
             if is_rank_0() and debug and i == 0:
                 self.logger.info(
-                    f"Inference arguments for dataset {data[0]['dataset']} category {data[0]['category']} is:\n{inference_kwargs}"
+                    f"Inference arguments for dataset {batch[0]['dataset']} category {batch[0]['category']} is:\n{inference_kwargs}"
                 )
                 self.logger.info("-" * 120)
                 self.logger.info("An example prompt and prompt with target is:")
@@ -384,12 +390,12 @@ class HuggingFaceModel(BaseModel):
                 self.logger.info("-" * 120)
                 self.logger.info(batch_prompt[0] + batch_target[0][0])
 
-            if not pretrain:
+            if not calculate_overall_loss:
                 batch_decodes, scores = self.generate(batch_prompt, max_new_tokens)
 
             if calculate_loss:
                 batch_losses, batch_target_token_nums, batch_bytes_nums = self.get_loss(
-                    batch_prompt, batch_target, pretrain
+                    batch_prompt, batch_target, calculate_overall_loss
                 )
 
             probs = []
@@ -399,7 +405,7 @@ class HuggingFaceModel(BaseModel):
                 # Otherwise this will violate the single-choice setting.
 
                 if calculate_loss:
-                    labels = [self.str_label_map[answers[i + j]["target"]] for j in range(len(batch_decodes))]
+                    labels = [self.str_label_map[batch[j]["target"]] for j in range(len(batch))]
 
                     loss_over_choices = loss_fct(scores, torch.tensor(labels, dtype=torch.long)).numpy().tolist()
 
@@ -408,29 +414,30 @@ class HuggingFaceModel(BaseModel):
                     {choice: probs[i][self.str_label_map[choice]] for choice in self.choices} for i in range(len(probs))
                 ]
 
-            for j in range(len(batch_prompt)):
-                if not pretrain:
-                    if isinstance(answers[i + j]["output"], list):
-                        answers[i + j]["output"].append(batch_decodes[j].strip())
+            for j in range(len(batch)):
+                if not calculate_overall_loss:
+                    if isinstance(batch[j]["output"], list):
+                        batch[j]["output"].append(batch_decodes[j].strip())
                     else:
-                        answers[i + j]["output"] = batch_decodes[j].strip()
+                        batch[j]["output"] = batch_decodes[j].strip()
 
                     if isinstance(scores, torch.Tensor):
-                        answers[i + j]["logits_over_choices"] = probs[j]
+                        batch[j]["logits_over_choices"] = probs[j]
 
                         if calculate_loss:
-                            answers[i + j]["loss_over_choices"] = loss_over_choices[j]
+                            batch[j]["loss_over_choices"] = loss_over_choices[j]
 
                 if calculate_loss:
-                    answers[i + j]["loss"] = (np.array(batch_losses[j]) / np.array(batch_target_token_nums[j])).tolist()
+                    batch[j]["loss"] = (np.array(batch_losses[j]) / np.array(batch_target_token_nums[j])).tolist()
 
                     # loss_sum is specially used for pertrain dataset for calculating per-byte-perplexity.
                     # However, loss (which is per sample loss) suffices for most cases.
-                    answers[i + j]["loss_sum"] = batch_losses[j]
-                    answers[i + j]["token_num"] = batch_target_token_nums[j]
+                    batch[j]["loss_sum"] = batch_losses[j]
+                    batch[j]["token_num"] = batch_target_token_nums[j]
 
                     if batch_bytes_nums:
-                        answers[i + j]["byte_num"] = batch_bytes_nums[j]
+                        batch[j]["byte_num"] = batch_bytes_nums[j]
+            answers.extend(batch)
 
             bar.update()
 
@@ -464,7 +471,7 @@ class HuggingFaceModel(BaseModel):
             return_tensors="pt",
             return_token_type_ids=False,
             max_length=self.model_max_length - max_new_tokens,
-        ).to(torch.cuda.current_device())
+        ).to(get_current_device())
 
         # Set output_scores=True to get prediction scores.
         outputs = self.model.generate(
@@ -495,7 +502,9 @@ class HuggingFaceModel(BaseModel):
         return decoded_sequences, scores
 
     @torch.no_grad()
-    def get_loss(self, batch_prompt: List[str], batch_target: List[List[str]], pretrain: bool) -> List[List[float]]:
+    def get_loss(
+        self, batch_prompt: List[str], batch_target: List[List[str]], calculate_overall_loss: bool
+    ) -> List[List[float]]:
         """
         Calculate loss only on target tokens.
 
@@ -512,13 +521,15 @@ class HuggingFaceModel(BaseModel):
         # We don't need to generate new tokens.
         # Target answer's length is usually << model_max_length, but we still call it in case.
         # We don't call self._get_truncated_prompts for batch_prompt because we need target answer's length first to reserve some space for target answer's tokens.
-        if not pretrain:
+        if not calculate_overall_loss:
             batch_target = [self._get_truncated_prompts(prompt_target, 0) for prompt_target in batch_target]
 
         # Get the number of target answers for different questions
         batch_target_nums = [len(prompt_target) for prompt_target in batch_target]
 
-        input_ids_list, labels_list, bytes_list = self._get_input_ids_and_labels(batch_prompt, batch_target, pretrain)
+        input_ids_list, labels_list, bytes_list = self._get_input_ids_and_labels(
+            batch_prompt, batch_target, calculate_overall_loss
+        )
 
         # Because of multiple target answers, the final batch size may be greater than self.batch_size.
         # We will generate new batches.
@@ -597,13 +608,13 @@ class HuggingFaceCausalLM(HuggingFaceModel):
         if shard_config is not None:
             self.model = AutoModelForCausalLM.from_pretrained(path, **model_kwargs)
             shard_former = ShardFormer(shard_config)
-            self.model, sharded_parameters = shard_former.optimize(self.model)
-            self.model.to(torch.cuda.current_device())
+            self.model, _ = shard_former.optimize(self.model)
+            self.model.to(get_current_device())
 
             if peft_path is not None:
                 raise NotImplementedError("ShardFormer for PEFT models is not implemented.")
         else:
-            self.model = AutoModelForCausalLM.from_pretrained(path, **model_kwargs).to(torch.cuda.current_device())
+            self.model = AutoModelForCausalLM.from_pretrained(path, **model_kwargs).to(get_current_device())
             if peft_path is not None:
                 self.model = PeftModel.from_pretrained(self.model, peft_path, is_trainable=False)
 

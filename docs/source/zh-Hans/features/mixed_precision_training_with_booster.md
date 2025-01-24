@@ -9,21 +9,22 @@
 **相关论文**
 
 - [Accelerating Scientific Computations with Mixed Precision Algorithms](https://arxiv.org/abs/0808.2794)
+- [FP8 Formats for Deep Learning](https://arxiv.org/pdf/2209.05433)
 
 ## 引言
 
 AMP 代表自动混合精度训练。
 在 Colossal-AI 中, 我们结合了混合精度训练的不同实现:
 
-1. torch.cuda.amp
+1. torch.amp
 2. apex.amp
 3. naive amp
 
-| Colossal-AI    | 支持张量并行 | 支持流水并行 | fp16 范围                                                 |
-| -------------- | ------------ | ------------ | --------------------------------------------------------- |
-| AMP_TYPE.TORCH | ✅           | ❌           | 在前向和反向传播期间，模型参数、激活和梯度向下转换至 fp16 |
-| AMP_TYPE.APEX  | ❌           | ❌           | 更细粒度，我们可以选择 opt_level O0, O1, O2, O3           |
-| AMP_TYPE.NAIVE | ✅           | ✅           | 模型参数、前向和反向操作，全都向下转换至 fp16             |
+| Colossal-AI    | 支持张量并行 | 支持流水并行 | fp16 范围                                               |
+|----------------|--------------|--------------|-------------------------------------------------------|
+| AMP_TYPE.TORCH | ✅            | ❌            | 在前向和反向传播期间，模型参数、激活和梯度向下转换至 fp16 |
+| AMP_TYPE.APEX  | ❌            | ❌            | 更细粒度，我们可以选择 opt_level O0, O1, O2, O3          |
+| AMP_TYPE.NAIVE | ✅            | ✅            | 模型参数、前向和反向操作，全都向下转换至 fp16             |
 
 前两个依赖于 PyTorch (1.6 及以上) 和 NVIDIA Apex 的原始实现。最后一种方法类似 Apex O2。在这些方法中，Apex-AMP 与张量并行不兼容。这是因为张量是以张量并行的方式在设备之间拆分的，因此，需要在不同的进程之间进行通信，以检查整个模型权重中是否出现 inf 或 nan。我们修改了 torch amp 实现，使其现在与张量并行兼容。
 
@@ -56,9 +57,13 @@ AMP 代表自动混合精度训练。
 
 ## Colossal-AI 中的 AMP
 
-我们支持三种 AMP 训练方法，并允许用户在没有改变代码的情况下使用 AMP 进行训练。booster 支持 amp 特性注入，如果您要使用混合精度训练，则在创建 booster 实例时指定`mixed_precision`参数;后续将会拓展`bf16`,`pf8`的混合精度训练.
+我们支持三种 AMP 训练方法，并允许用户在没有改变代码的情况下使用 AMP 进行训练。booster 支持 amp 特性注入，如果您要使用混合精度训练，则在创建 booster 实例时指定`mixed_precision`参数; 后续将会拓展`bf16`.
 
-#### booster 启动方式
+我们目前只支持`Linear`层的`fp8`混合精度训练，如果您需要使用，请在创建 plugin实例时指定`use_fp8`参数。
+
+为了减少低带宽场景下多机之间的通讯负载，我们还支持了FP8通讯。如果您需要使用，请在创建 plugin实例时指定`fp8_communication`参数。
+
+### booster 启动方式
 
 您可以在创建 booster 实例时，指定`mixed_precision="fp16"`即使用 torch amp。
 
@@ -70,7 +75,6 @@ AMP 代表自动混合精度训练。
     'fp16': torch amp
     'fp16_apex': apex amp,
     'bf16': bf16,
-    'fp8': fp8,
     'fp16_naive': naive amp
 """
 from colossalai import Booster
@@ -118,6 +122,10 @@ booster = Booster(mixed_precision=mixed_precision,...)
 
 当使用`colossalai.booster`时, 首先需要实例化一个模型、一个优化器和一个标准。将输出模型转换为内存消耗较小的 AMP 模型。如果您的输入模型已经太大，无法放置在 GPU 中，请使用`dtype=torch.float16`实例化你的模型。或者请尝试更小的模型，或尝试更多的并行化训练技术！
 
+### FP8通讯
+
+在低带宽场景下，为了减少多机间的通讯负载，我们支持使用FP8的形式对通讯进行压缩，可以在初始化plugin实例（如`GeminiPlugin`）时使用fp8_communication=True来启用。此时多机之间all-to-all, all-gather以及P2P操作将使用FP8的格式进行数据传输。受限于NCCL库的支持，目前不支持缩减(Reduction)算子如Allreduce, ReduceScatter的FP8通讯。
+
 ## 实例
 
 下面我们将展现如何在 Colossal-AI 使用 AMP。在该例程中，我们使用 Torch AMP.
@@ -153,7 +161,7 @@ parser = colossalai.get_default_parser()
 args = parser.parse_args()
 
 # launch from torch
-colossalai.launch_from_torch(config=dict())
+colossalai.launch_from_torch()
 
 ```
 

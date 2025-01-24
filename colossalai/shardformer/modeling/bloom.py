@@ -6,9 +6,11 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from torch.nn import functional as F
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
+    CausalLMOutputWithPast,
     QuestionAnsweringModelOutput,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
@@ -25,6 +27,8 @@ from transformers.utils import logging
 from colossalai.pipeline.stage_manager import PipelineStageManager
 from colossalai.shardformer.layer._operation import gather_forward_split_backward, split_forward_gather_backward
 from colossalai.shardformer.shard import ShardConfig
+
+from ..layer import dist_cross_entropy
 
 logger = logging.get_logger(__name__)
 
@@ -205,18 +209,23 @@ class BloomPipelineForwards:
         alibi = self.build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
 
         # causal_mask is constructed every stage and its input is passed through different stages
-        causal_mask = self._prepare_attn_mask(
+        causal_mask = _prepare_4d_causal_attention_mask(
             attention_mask,
             input_shape=(batch_size, seq_length),
+            inputs_embeds=hidden_states,
             past_key_values_length=past_key_values_length,
         )
-
+        causal_mask = causal_mask.bool()
         # split the input tensor along sequence dimension
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len/TP_size, hidden_size]
-        if shard_config.enable_sequence_parallelism:
-            hidden_states = split_forward_gather_backward(
-                hidden_states, dim=1, process_group=shard_config.tensor_parallel_process_group
-            )
+        if shard_config and shard_config.enable_sequence_parallelism:
+            if shard_config.sequence_parallelism_mode == "split_gather":
+                hidden_states = split_forward_gather_backward(
+                    hidden_states,
+                    dim=1,
+                    process_group=shard_config.tensor_parallel_process_group,
+                    fp8_communication=shard_config.fp8_communication,
+                )
 
         start_idx, end_idx = stage_index[0], stage_index[1]
         for i, (block, layer_past) in enumerate(
@@ -226,21 +235,15 @@ class BloomPipelineForwards:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        # None for past_key_value
-                        return module(*inputs, use_cache=use_cache, output_attentions=output_attentions)
-
-                    return custom_forward
-
-                outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
+                outputs = self._gradient_checkpointing_func(
+                    block.__call__,
                     hidden_states,
                     alibi,
                     causal_mask,
                     layer_past,
                     head_mask[i],
+                    use_cache,
+                    output_attentions,
                 )
             else:
                 outputs = block(
@@ -261,10 +264,14 @@ class BloomPipelineForwards:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
 
         # When sequence parallelism done, gather the output tensor in forward and split it in backward
-        if shard_config.enable_sequence_parallelism:
-            hidden_states = gather_forward_split_backward(
-                hidden_states, dim=1, process_group=shard_config.tensor_parallel_process_group
-            )
+        if shard_config and shard_config.enable_sequence_parallelism:
+            if shard_config.sequence_parallelism_mode == "split_gather":
+                hidden_states = gather_forward_split_backward(
+                    hidden_states,
+                    dim=1,
+                    process_group=shard_config.tensor_parallel_process_group,
+                    fp8_communication=shard_config.fp8_communication,
+                )
 
         if stage_manager.is_last_stage():
             # Add last hidden state
@@ -356,20 +363,16 @@ class BloomPipelineForwards:
         past_key_values = None
         if stage_manager.is_last_stage():
             hidden_states = transformer_outputs[0]
-            lm_logits = self.lm_head(hidden_states)
+            lm_logits = self.lm_head(hidden_states).contiguous()
 
             loss = None
             if labels is not None:
-                # move labels to correct device to enable model parallelism
-                labels = labels.to(lm_logits.device)
-                # Shift so that tokens < n predict n
-                shift_logits = lm_logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                batch_size, seq_length, vocab_size = shift_logits.shape
-                # Flatten the tokens
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(
-                    shift_logits.view(batch_size * seq_length, vocab_size), shift_labels.view(batch_size * seq_length)
+                loss = dist_cross_entropy(
+                    labels,
+                    lm_logits,
+                    shard_config,
+                    self.lm_head.out_features,
+                    self.transformer.dtype,
                 )
 
             if not return_dict:
@@ -463,7 +466,10 @@ class BloomPipelineForwards:
                 sequence_lengths = -1
             else:
                 if input_ids is not None:
-                    sequence_lengths = (torch.ne(input_ids, self.config.pad_token_id).sum(-1) - 1).to(logits.device)
+                    # if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
+                    sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+                    sequence_lengths = sequence_lengths % input_ids.shape[-1]
+                    sequence_lengths = sequence_lengths.to(logits.device)
                 else:
                     sequence_lengths = -1
                     logger.warning(
@@ -699,93 +705,6 @@ class BloomPipelineForwards:
             return {"hidden_states": hidden_states}
 
 
-def get_bloom_flash_attention_forward(enabel_jit_fused=False):
-    try:
-        from xformers.ops import memory_efficient_attention as me_attention
-    except:
-        raise ImportError("Error: xformers module is not installed. Please install it to use flash attention.")
-    from transformers.models.bloom.modeling_bloom import BloomAttention
-
-    def forward(
-        self: BloomAttention,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        alibi: torch.Tensor,
-        attention_mask: torch.Tensor,
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        use_cache: bool = False,
-        output_attentions: bool = False,
-    ):
-        fused_qkv = self.query_key_value(hidden_states)
-        (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
-        batch_size, tgt_len, _, _ = query_layer.size()
-
-        _, kv_length, _, _ = key_layer.size()
-
-        proj_shape = (batch_size, tgt_len, self.num_heads, self.head_dim)
-        query_layer = query_layer.contiguous().view(*proj_shape)
-        key_layer = key_layer.contiguous().view(*proj_shape)
-        value_layer = value_layer.contiguous().view(*proj_shape)
-
-        if layer_past is not None:
-            past_key, past_value = layer_past
-            # concatenate along seq_length dimension:
-            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
-            #  - value: [batch_size * self.num_heads, kv_length, head_dim]
-            key_layer = torch.cat((past_key, key_layer), dim=1)
-            value_layer = torch.cat((past_value, value_layer), dim=1)
-
-        if use_cache is True:
-            present = (key_layer, value_layer)
-        else:
-            present = None
-
-        tgt_len = key_layer.size()[1]
-
-        attention_numerical_mask = torch.zeros(
-            (batch_size, self.num_heads, tgt_len, kv_length),
-            dtype=torch.float32,
-            device=query_layer.device,
-            requires_grad=True,
-        )
-        attention_numerical_mask = (
-            attention_numerical_mask + alibi.view(batch_size, self.num_heads, 1, kv_length) * self.beta
-        )
-        attention_numerical_mask = torch.masked_fill(
-            attention_numerical_mask, attention_mask, torch.finfo(torch.float32).min
-        )
-        attention_numerical_mask = attention_numerical_mask.to(query_layer.dtype)
-
-        context_layer = me_attention(
-            query_layer,
-            key_layer,
-            value_layer,
-            attn_bias=attention_numerical_mask,
-            scale=self.inv_norm_factor,
-            p=self.attention_dropout.p,
-        )
-        context_layer = context_layer.reshape(-1, kv_length, self.hidden_size)
-        if self.pretraining_tp > 1 and self.slow_but_exact:
-            slices = self.hidden_size / self.pretraining_tp
-            output_tensor = torch.zeros_like(context_layer)
-            for i in range(self.pretraining_tp):
-                output_tensor = output_tensor + F.linear(
-                    context_layer[:, :, int(i * slices) : int((i + 1) * slices)],
-                    self.dense.weight[:, int(i * slices) : int((i + 1) * slices)],
-                )
-        else:
-            output_tensor = self.dense(context_layer)
-
-        # TODO to replace with the bias_dropout_add function in jit
-        output_tensor = self.dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
-        outputs = (output_tensor, present, None)
-
-        return outputs
-
-    return forward
-
-
 def get_jit_fused_bloom_attention_forward():
     from transformers.models.bloom.modeling_bloom import BloomAttention
 
@@ -1000,15 +919,20 @@ def get_bloom_sequence_parallel_forward_fn(shard_config: ShardConfig):
 
         alibi = self.build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
 
-        causal_mask = self._prepare_attn_mask(
+        causal_mask = _prepare_4d_causal_attention_mask(
             attention_mask,
             input_shape=(batch_size, seq_length),
+            inputs_embeds=hidden_states,
             past_key_values_length=past_key_values_length,
         )
+        causal_mask = causal_mask.bool()
         # split the input tensor along sequence dimension
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len/TP_size, hidden_size]
         hidden_states = split_forward_gather_backward(
-            hidden_states, dim=1, process_group=shard_config.tensor_parallel_process_group
+            hidden_states,
+            dim=1,
+            process_group=shard_config.tensor_parallel_process_group,
+            fp8_communication=shard_config.fp8_communication,
         )
 
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
@@ -1016,21 +940,15 @@ def get_bloom_sequence_parallel_forward_fn(shard_config: ShardConfig):
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        # None for past_key_value
-                        return module(*inputs, use_cache=use_cache, output_attentions=output_attentions)
-
-                    return custom_forward
-
-                outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
+                outputs = self._gradient_checkpointing_func(
+                    block.__call__,
                     hidden_states,
                     alibi,
                     causal_mask,
                     layer_past,
                     head_mask[i],
+                    use_cache,
+                    output_attentions,
                 )
             else:
                 outputs = block(
@@ -1052,7 +970,10 @@ def get_bloom_sequence_parallel_forward_fn(shard_config: ShardConfig):
 
         # When sequence parallelism done, gather the output tensor in forward and split it in backward
         hidden_states = gather_forward_split_backward(
-            hidden_states, dim=1, process_group=shard_config.tensor_parallel_process_group
+            hidden_states,
+            dim=1,
+            process_group=shard_config.tensor_parallel_process_group,
+            fp8_communication=shard_config.fp8_communication,
         )
         # Add last hidden state
         hidden_states = self.ln_f(hidden_states)
@@ -1068,6 +989,70 @@ def get_bloom_sequence_parallel_forward_fn(shard_config: ShardConfig):
             past_key_values=presents,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
+        )
+
+    return forward
+
+
+def get_lm_forward_with_dist_cross_entropy(shard_config: ShardConfig):
+    from transformers import BloomForCausalLM
+
+    def forward(
+        self: BloomForCausalLM,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
+            `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
+            are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        transformer_outputs = self.transformer(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        past_key_values = None
+        hidden_states = transformer_outputs[0]
+        lm_logits = self.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            loss = dist_cross_entropy(
+                labels, lm_logits, shard_config, self.lm_head.out_features, self.transformer.dtype
+            )
+
+        if not return_dict:
+            output = (lm_logits,) + transformer_outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=lm_logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
         )
 
     return forward

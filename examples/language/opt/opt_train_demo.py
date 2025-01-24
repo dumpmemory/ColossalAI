@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import datasets
 import torch
 import transformers
@@ -8,9 +10,11 @@ from transformers import AutoConfig, AutoTokenizer, OPTForCausalLM, get_linear_s
 from transformers.utils.versions import require_version
 
 import colossalai
+from colossalai.accelerator import get_accelerator
 from colossalai.booster import Booster
 from colossalai.booster.plugin import GeminiPlugin, HybridParallelPlugin, LowLevelZeroPlugin, TorchDDPPlugin
 from colossalai.cluster import DistCoordinator
+from colossalai.lazy import LazyInitContext
 from colossalai.logging import disable_existing_loggers, get_dist_logger
 from colossalai.nn.optimizer import HybridAdam
 
@@ -41,9 +45,7 @@ def train_epoch(epoch, model, optimizer, _criterion, lr_scheduler, dataloader, b
         # Forward pass
         for _ in pbar:
             if use_pipeline:
-                outputs = booster.execute_pipeline(
-                    dataloader, model, _criterion, optimizer, return_loss=True, return_outputs=True
-                )
+                outputs = booster.execute_pipeline(dataloader, model, _criterion, optimizer, return_loss=True)
                 # Backward and optimize
                 if is_pp_last_stage:
                     loss = outputs["loss"]
@@ -66,7 +68,7 @@ def main():
     args = parse_demo_args()
 
     # Launch ColossalAI
-    colossalai.launch_from_torch(config={}, seed=args.seed)
+    colossalai.launch_from_torch(seed=args.seed)
     coordinator = DistCoordinator()
     world_size = coordinator.world_size
 
@@ -79,14 +81,6 @@ def main():
     else:
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
-
-    # Build OPT model
-    config = AutoConfig.from_pretrained(args.model_name_or_path)
-    model = OPTForCausalLM.from_pretrained(args.model_name_or_path, config=config)
-    logger.info(f"Finish loading model from {args.model_name_or_path}", ranks=[0])
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
 
     # Set plugin
     booster_kwargs = {}
@@ -111,6 +105,21 @@ def main():
         )
 
     logger.info(f"Set plugin as {args.plugin}", ranks=[0])
+
+    # Build OPT model
+    config = AutoConfig.from_pretrained(args.model_name_or_path)
+    # Build OPT model
+    init_ctx = (
+        LazyInitContext(default_device=get_accelerator().get_current_device())
+        if isinstance(plugin, (GeminiPlugin, HybridParallelPlugin))
+        else nullcontext()
+    )
+    with init_ctx:
+        model = OPTForCausalLM.from_pretrained(args.model_name_or_path, config=config)
+    logger.info(f"Finish loading model from {args.model_name_or_path}", ranks=[0])
+
+    # Enable gradient checkpointing
+    model.gradient_checkpointing_enable()
 
     # Prepare tokenizer and dataloader
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)

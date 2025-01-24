@@ -15,7 +15,7 @@ default_inference_kwargs = {
     "calculate_loss": False,
     "all_classes": ["A", "B"],
     "language": LANGUAGE,
-    "pretrain": False,
+    "calculate_overall_loss": False,
     "max_new_tokens": 32,
 }
 
@@ -28,7 +28,7 @@ class CValuesDataset(BaseDataset):
     """
 
     @staticmethod
-    def load(path: str, logger: DistributedLogger, few_shot: bool) -> List[Dict]:
+    def load(path: str, logger: DistributedLogger, *args, **kwargs) -> List[Dict]:
         dataset = {"test": {}}
         file_path = os.path.join(path, "cvalues_responsibility_mc.jsonl")
         data_list = []

@@ -87,8 +87,7 @@ import colossalai
 args = colossalai.get_default_parser().parse_args()
 
 # launch distributed environment
-colossalai.launch(config=args.config,
-                  rank=args.rank,
+colossalai.launch(rank=args.rank,
                   world_size=args.world_size,
                   host=args.host,
                   port=args.port,
@@ -106,20 +105,11 @@ First, we need to set the launch method in our code. As this is a wrapper of the
 use `colossalai.launch_from_torch`. The arguments required for distributed environment such as rank, world size, host and port are all set by the PyTorch
 launcher and can be read from the environment variable directly.
 
-config.py
-```python
-BATCH_SIZE = 512
-LEARNING_RATE = 3e-3
-WEIGHT_DECAY = 0.3
-NUM_EPOCHS = 2
-```
 train.py
 ```python
 import colossalai
 
-colossalai.launch_from_torch(
-    config="./config.py",
-)
+colossalai.launch_from_torch()
 ...
 ```
 
@@ -141,17 +131,18 @@ with one simple command. There are two ways you can launch multi-node jobs.
 
 This is suitable when you only have a few nodes. Let's say I have two nodes, namely `host1` and `host2`,  I can start
 multi-node training with the following command. Compared to single-node training, you must specify the `master_addr`
-option, which is auto-set to localhost if running on a single node only.
+option, which is auto-set to localhost if running on a single node only. \
+Additionally, you must also ensure that all nodes share the same open ssh port, which can be specified using --ssh-port.
 
 :::caution
 
-`master_addr` cannot be localhost when running on multiple nodes, it should be the hostname or IP address of a node.
+`master_addr` cannot be localhost when running on multiple nodes, it should be the **hostname or IP address** of a node.
 
 :::
 
 ```shell
 # run on these two nodes
-colossalai run --nproc_per_node 4 --host host1,host2 --master_addr host1 test.py
+colossalai run --nproc_per_node 4 --host host1,host2 --master_addr host1 test.py --ssh-port 22
 ```
 - Run with `--hostfile`
 
@@ -203,7 +194,6 @@ Do this in your training script:
 import colossalai
 
 colossalai.launch_from_slurm(
-    config=<CONFIG>,
     host=args.host,
     port=args.port
 )
@@ -224,7 +214,6 @@ use them to start the distributed backend.
 Do this in your train.py:
 ```python
 colossalai.launch_from_openmpi(
-    config=<CONFIG>,
     host=args.host,
     port=args.port
 )
@@ -238,3 +227,5 @@ mpirun --hostfile <my_hostfile> -np <num_process> python train.py --host <node n
 
 - --hostfile: use this option to specify a list of hosts on which to run
 - --np: set the number of processes (GPUs) to launch in total. For example, if --np 4, 4 python processes will be initialized to run train.py.
+
+<!-- doc-test-command: echo  -->

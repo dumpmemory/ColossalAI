@@ -5,17 +5,27 @@ from torch import Tensor
 from torch._utils import _flatten_dense_tensors
 from torch.distributed import ProcessGroup
 
+from colossalai.accelerator.api import get_accelerator
+
 from .base_store import BaseStore
 
 
 class BucketStore(BaseStore):
-    def __init__(self, torch_pg: ProcessGroup):
+    def __init__(
+        self,
+        torch_pg: ProcessGroup,
+        reduce_bucket_size: int,
+    ):
         super().__init__(torch_pg)
+        self.reduce_bucket_size = reduce_bucket_size
+        self.reset_all()
+        self.comm_stream = get_accelerator().Stream()
 
+    def reset_all(self) -> None:
         # init
         self.current_group_id = 0
         self._num_elements_in_bucket = 0
-        # mapping gardient slices and parameter
+        # mapping gradient slices and parameter
         self.grad_to_param_mapping = dict()
 
         self._grad_in_bucket = dict()
@@ -59,7 +69,7 @@ class BucketStore(BaseStore):
         self.offset_list[-1] += 1
 
     def build_grad_in_bucket(self):
-        """Orgnize parameters' gradient(padding and split), follows the paramters' splitting method
+        """Organize parameters' gradient(padding and split), follows the parameters' splitting method
 
         Data structure of self._grad_in_bucket:
         {
@@ -68,13 +78,13 @@ class BucketStore(BaseStore):
         }
         """
         for param, padding_size in zip(self._param_list, self._padding_size):
-            grad = param.grad.clone().detach().flatten()
+            grad = param.grad.detach().flatten()
             if padding_size > 0:
                 with torch.no_grad():
                     grad = torch.nn.functional.pad(grad.view(-1), [0, padding_size])
             grad_list = grad.split(grad.numel() // self._world_size)
             for rank in range(self._world_size):
-                grad_current_rank = grad_list[rank].clone().detach()
+                grad_current_rank = grad_list[rank].detach()
                 self.grad_to_param_mapping[id(grad_current_rank)] = id(param)
                 self._grad_in_bucket[rank].append(grad_current_rank)
             param.grad = None
@@ -91,7 +101,7 @@ class BucketStore(BaseStore):
         return self._grad_in_bucket
 
     def get_flatten_grad(self) -> Tensor:
-        """Return the flattened gradients slices in the bucket, the data orginization of the flattened tensor:
+        """Return the flattened gradients slices in the bucket, the data organization of the flattened tensor:
         [grad0_rank0, grad1_rank0, ..., grad_0_rank1, grad1_rank1, ....]
 
         Returns:
@@ -100,7 +110,7 @@ class BucketStore(BaseStore):
 
         flat_grad = []
         for grad_list in self._grad_in_bucket.values():
-            flat_grad.append(_flatten_dense_tensors(grad_list))
+            flat_grad.extend(grad_list)
         flat_grad = _flatten_dense_tensors(flat_grad)
         return flat_grad
 

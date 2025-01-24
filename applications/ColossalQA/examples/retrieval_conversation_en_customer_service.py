@@ -1,6 +1,7 @@
 """
 Script for English retrieval based conversation system backed by LLaMa2
 """
+
 import argparse
 import json
 import os
@@ -142,7 +143,7 @@ if __name__ == "__main__":
         agent_response = retrieval_chain.run(
             query=user_input,
             stop=["Human: "],
-            rejection_trigger_keywrods=EN_RETRIEVAL_QA_TRIGGER_KEYWORDS,
+            rejection_trigger_keywords=EN_RETRIEVAL_QA_TRIGGER_KEYWORDS,
             rejection_answer=EN_RETRIEVAL_QA_REJECTION_ANSWER,
         )
         agent_response = agent_response.split("\n")[0]
